@@ -272,7 +272,8 @@ write_csv(mb_data, "../../data/analysis_datasets/collab_jess_fran/spls_data/spls
 ```
 
 # Analyses
-## Brain --> Internalizing Symptoms sPLS1 models (X is matrix, Y is univariate)
+## Identification of Brain Signatures
+Brain --> Internalizing Symptoms sPLS1 models (X is matrix, Y is univariate)
 Vignette for sPLS1 regression models: https://mixomicsteam.github.io/mixOmics-Vignette/id_04.html#id_04:spls1 
 
 Note: data in spls are scaled by default 
@@ -419,7 +420,7 @@ brain_cbcl_win$REW_MTL[brain_cbcl_win$subID=="010-21310"] <- top_5_REW.MTL_value
 brain_cbcl_win$REW_MTL[brain_cbcl_win$subID=="020-08045"] <- top_5_REW.MTL_values$REW_MTL[3]
 ```
 
-### Tune the sPLS Brain --> Internalizing Symptoms models with the winsorized dataset
+### Tune the Brain --> Internalizing Symptoms sPLS models with the winsorized dataset
 ```{r}
 brain_cbcl_win_noids <- brain_cbcl_win %>% dplyr::select(-subID)
 rownames(brain_cbcl_win_noids) <- brain_cbcl_ids$subID
@@ -500,7 +501,7 @@ brain_load_vip_comb <- brain_load_vip_c1 %>% bind_rows(brain_load_vip_c2) %>% dp
 write_csv(brain_load_vip_comb, "tables/TableS1.csv")
 ```
 
-### Plot Final Brain --> Internalizing Symptoms Loadings
+### Plot Final Brain --> Internalizing Symptoms sPLS Model Loadings
 ```{r}
 # plot loadings using dataframes for the added flexibility of ggplot
 # create a factor that sorts the loadings by magnitude 
@@ -587,6 +588,10 @@ summary <- means %>% full_join(sds, by = "network") %>% full_join(mins, by = "ne
 write_csv(summary, "brain_network_descriptives.csv")
 ```
 
+## Covariate Selection
+Now that we have the brain signature component scores, we can do covariate selection for the regression models. 
+a-priori covariates: sex, gestational age, birthweight, mean FD, delivery mode
+Selection is on diet covariates
 ### Read in additional (diet) covariates
 ```{r}
 # merge component scores with rest of dataset
@@ -683,7 +688,7 @@ cor.test(braincomp_alpha_covs$GA_centered, braincomp_alpha_covs$BW_centered) # y
 # we want to add diet covariates to the regression with brain and internalizing, bc 1) Fat is related to brain and PUFA is related to internalizing, 2) we want to keep largely same covariate set for each analysis
 ```
 
-### Missing date rates for covariates
+### Missing data rates for covariates
 ```{r}
 # get analytic sample with cbcl, brain, and gm
 sample_braincomp_alpha_covs <- braincomp_alpha_covs %>% dplyr::filter(!is.na(cbclintprobtot_y7))
@@ -698,12 +703,13 @@ sample_braincomp_alpha_covs %>% group_by(is.na(Fibre.per.1000kcal)) %>% summaris
 sample_braincomp_alpha_covs %>% dplyr::count(is.na(any_bf_months)) # 53/55 (4% missing)
 ```
 
+## Brain Signatures --> Internalizing Regression Models
 ### Transform the internalizing symptom outcome variable for linear regression
 Box-cox transformation in R: https://www.r-bloggers.com/2022/10/box-cox-transformation-in-r/ 
 ```{r}
 # distribution of component scores
-gf_histogram(~brain.int.win.comp_scores$brain_int_win_comp1, bins=15) #normal enough, a few outliers
-gf_histogram(~brain.int.win.comp_scores$brain_int_win_comp2, bins=15) #skewed
+gf_histogram(~brain.int.win.comp_scores$brain_int_win_comp1, bins=15) #normal enough
+gf_histogram(~brain.int.win.comp_scores$brain_int_win_comp2, bins=15) #a bit skewed
 gf_histogram(~metadata_comp$cbclintprobtot_y7) # skewed; do box-cox transformation 
 
 # box-cox transformation on intprob (add constant of 1 to all values to make it positive, required for box-cox)
@@ -734,10 +740,10 @@ metadata_comp <- metadata_comp %>%
   )
 
 #graph transformed varaible
-gf_histogram(~metadata_comp$cbclintprobtot_y7_pos_boxcox) #looks slightly better
+gf_histogram(~metadata_comp$cbclintprobtot_y7_pos_boxcox) #looks somewhat better
 ```
 
-### Brain Signatures --> Internalizing Regression Model, controlling for selected covariates
+### Brain Signatures --> Internalizing Regression Models, controlling for selected covariates
 ```{r}
 # regression with comp scores predicting internalizing, controlling for covariates
 comp1_int_trans_diet <- lm(cbclintprobtot_y7_pos_boxcox ~ brain_int_win_comp1 + sex_centered + BW_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + meanFD_centered, data=braincomp_alpha_covs)
@@ -747,7 +753,8 @@ comp2_int_trans <- lm(cbclintprobtot_y7_pos_boxcox ~ brain_int_win_comp2 + sex_c
 tab_model(comp2_int_trans, robust=TRUE, show.std=TRUE, show.se=TRUE) # comp2 is positively related to internalizing
 ```
 
-## Brain Signatures Associations with Microbiome Variables
+## Identification of Microbiome Asosciations with Brain Signatures
+Microbiome Profiles and Alpha Diversity
 
 ### Alpha Diversity
 Alpha diversity + covs ~ brain comps
@@ -951,7 +958,7 @@ mb_data_brainint_win <- mb_data_brainint_win %>% dplyr::select(-subID)
 rownames(mb_data_brainint_win) <- ids$subID
 ```
 
-### Microbial Pattern(s) with SOFA, MTL, SAL Intra-Network Signature, low outlier winsorized
+### Microbial Profiles(s) with SOFA, MTL, SAL Intra-Network Signature, low outlier winsorized
 ```{r}
 # initial sPLS model (should specify a large number of components first)
 tune.spls1.braincomp.mbwin <- pls(X=mb_data_brainint_win, Y=brain.int.win.comp_scores$brain_int_win_comp1, ncomp=4, mode='regression')
@@ -1093,7 +1100,7 @@ braincomp2.mbwin <- as.data.frame(spls1.braincomp2.mb$variates$X) %>%
   rownames_to_column(var="subID")
 ```
 
-### Graph Microbe Loadings for SOFA Inter-Network Signature, and all Microbial Profiles Together
+### Graph Microbe Loadings for SOFA Inter-Network Signature, and Visualize all Microbial Profiles Together
 ```{r}
 # extract feature loadings
 braincomp2_mb1 <- selectVar(spls1.braincomp2.mb, comp = 1)$X$value %>% rownames_to_column(var = "genus")
@@ -1140,7 +1147,8 @@ mb_pattern1 + mb_pattern2 + mb_pattern3
 #ggsave('figures/Figure2.png', mb_pattern1 + mb_pattern2 + mb_pattern3, width = 12, height=5, dpi=1000)
 ```
 
-### Association of Microbial Patterns with Brain Signatures, controlling for covariates
+## Microbial Profiles --> Brain Signatures Regression Models
+### Association of Microbial Profiles with Brain Signatures, controlling for covariates
 Covariates are PUFA, dietary fat, fiber, GA, BW, and sex
 ```{r}
 # add mb component scores to larger dataset with all covs and brain comp scores
@@ -1165,7 +1173,9 @@ braincomp2_mb_ncovs <- lm(brain_int_noamyg_win_comp2 ~ mb2_braincomp2, data = al
 tab_model(braincomp2_mb_ncovs, robust=TRUE, show.std=TRUE) #positive, B=0.55, p < .001
 ```
 
-### Association of Microbial Patterns with Internalizing Symptoms, controlling for covariates (Total Effects)
+## Mediation Analysis
+
+### Association of Microbial Profiles with Internalizing Symptoms, controlling for covariates (Mediation Model Total Effects)
 ```{r}
 # N=43 for the below with covs, N=55 for without covs
 
@@ -1195,7 +1205,7 @@ faith_internalizing <- lm(cbclintprobtot_y7_pos_boxcox ~ faith_pd + sex_centered
 tab_model(faith_internalizing, robust=TRUE, show.std=TRUE, show.se=TRUE)
 ```
 
-## Mediation Models: Microbiome Features --> Brain Signatures --> Internalizing Symptoms 
+### Mediation Models: Microbiome Features --> Brain Signatures --> Internalizing Symptoms 
 Before using process run entire process.R script from Andrew Hayes to load the process() function
 ```{r}
 # rename columns in all data with % in them to get function to work
