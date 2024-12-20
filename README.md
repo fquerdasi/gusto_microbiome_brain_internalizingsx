@@ -5,6 +5,7 @@ Preprint can be found at: https://osf.io/preprints/psyarxiv/u9dw5
 
 ## System Requirements
 This code has been tested on a MacBook Pro with MacOS Sequioa 15.01, running R version 4.2.3 in RStudio version 2022.07.2.   
+
 **Required packages include:**   
 attached base packages:
 [1] stats     graphics  grDevices utils     datasets  methods   base     
