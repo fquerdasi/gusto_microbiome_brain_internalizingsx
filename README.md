@@ -18,11 +18,15 @@ other attached packages:
 
 No non-standard hardware is needed.
 
-## Installation Guide
-To install R, go here:
-To install RStudio, follow instructions here:
+## Installation Guide  
+To install R, go here: [Windows](https://cran.r-project.org/bin/windows/base/old/) or [Mac](https://cran.r-project.org/bin/macosx/)  
+To install RStudio, follow instructions [here](https://posit.co/download/rstudio-desktop/)  
+Each of these installations should take a few minutes.   
 
 To install the required packages, you can run the following code (should take around 5 minutes):
 ```
 install.packages(c("tidyverse", "MixOmics", "readxl", "vegan", "compositions", "mosaic", "Hmisc", "rstatix", "sjPlot", "patchwork", "corrplot", "MASS", "ggplot2"))
 ```
+
+## Demo Instructions 
+coming soon
