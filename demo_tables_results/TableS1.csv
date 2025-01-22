@@ -1,0 +1,11 @@
+network,signature,loading,vip
+SML,SOFA Intra-Network,-0.62,5.9
+VIS_MTL,SOFA Intra-Network,0.56,5.4
+FPN_SML,SOFA Intra-Network,-0.47,4.5
+AUD,SOFA Intra-Network,-0.27,2.6
+SAL,SOFA Intra-Network,-0.033,0.32
+DMN_VIS,SOFA Inter-Network,-0.73,4.3
+FPN_REW,SOFA Inter-Network,0.44,2.6
+DMN_MTL,SOFA Inter-Network,0.35,2
+DMN_SML,SOFA Inter-Network,0.29,1.7
+DAN_PMN,SOFA Inter-Network,0.26,1.5

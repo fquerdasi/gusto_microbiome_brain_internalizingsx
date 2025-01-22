@@ -1,0 +1,16 @@
+Measure,Mean,SD,Min,Max
+BW_centered,0.04,0.36,-1.09,0.91
+CHO_%energy,54.6,6.45,40.6,67.69
+Fat_%energy,30.44,6.83,9.79,50.68
+Fibre.per.1000kcal,6.17,3.03,-0.55,13.61
+GA_centered,0.3,1.05,-1.61,3.75
+MUFA_%,32.88,10.63,6.14,53.7
+PUFA_%,33.95,14.81,-1.4,60
+Protein_%energy,16.01,3.46,8.85,23.69
+SatFat_%,33.13,9.25,11.68,48.4
+cbclintprobtot_y7,5.44,4.65,0,19
+faith_pd,5.35,1.74,2.25,9.47
+meanFD_centered,-0.01,0.03,-0.11,0.05
+observed_features,82.92,24.27,17.3,132.25
+pielou_evenness,0.51,0.09,0.28,0.71
+shannon_entropy,3.12,0.78,0.89,4.43
