@@ -31,4 +31,12 @@ install.packages(c("tidyverse", "MixOmics", "readxl", "vegan", "compositions", "
 The mediation models in this code use the PROCESS macro for R. You can download the it [here](https://haskayne.ucalgary.ca/CCRAM/resource-hub). Once downloaded, open the folder, go to the subfolder "PROCESS v4.3 for R", open the script "process.R" and run it through in its entirety (without changing anything) to load the process function. 
 
 ## Demo Instructions 
-coming soon
+To check the code, you can use a demo script that runs the custom code from the main analysis script on a simulated dataset, and check to make sure that you get the same results as expected.  
+Download the demo script "demo_gusto_mbXbrain_internalizing_clean_final.Rmd", simulated dataset "data_simultated.csv", and demo results materials:
+* demo_tables_results
+* demo_figures_results
+* demo_gusto_mbXbrain_internalizing_clean_final.html
+
+In the folder where you downloaded the script, make two new folders: "tables_demo" and "figures_demo". As it runs, the script will output tables and figures to those folders. To run the script, open in Rstudio and click "Run All" in the top right of the UI. The code should take 5-10 minutes to run through completely. Afterwards, you can check to confirm those tables and figures match those in the demo_tables_results and demo_figures_results tables. You can also confirm that the in-line results (e.g., model statistics) match the results from the knitted HTML file. 
+
+
