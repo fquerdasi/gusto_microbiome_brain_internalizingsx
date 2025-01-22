@@ -17,7 +17,7 @@ other attached packages:
 [19] dplyr_1.1.2        purrr_1.0.1        readr_2.1.4        tidyr_1.3.0        tibble_3.2.1       ggplot2_3.4.2     
 [25] tidyverse_2.0.0    lmerTest_3.1-3     lme4_1.1-33        Matrix_1.5-4.1   
 
-No non-standard hardware is needed.
+The only non-standard software is the PROCESS macro for R. Instructions for installing and loading it are below. 
 
 ## Installation Guide  
 To install R, go here: [Windows](https://cran.r-project.org/bin/windows/base/old/) or [Mac](https://cran.r-project.org/bin/macosx/)  
