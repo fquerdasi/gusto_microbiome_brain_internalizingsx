@@ -28,6 +28,7 @@ To install the required packages, you can run the following code (should take ar
 ```
 install.packages(c("tidyverse", "MixOmics", "readxl", "vegan", "compositions", "mosaic", "Hmisc", "rstatix", "sjPlot", "patchwork", "corrplot", "MASS", "ggplot2"))
 ```
+The mediation models in this code use the PROCESS macro for R. You can download the it [here](https://haskayne.ucalgary.ca/CCRAM/resource-hub). Once downloaded, open the folder, go to the subfolder "PROCESS v4.3 for R", open the script "process.R" and run it through in its entirety (without changing anything) to load the process function. 
 
 ## Demo Instructions 
 coming soon
