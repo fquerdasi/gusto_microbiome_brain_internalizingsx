@@ -2,6 +2,7 @@
 Analysis scripts used for the manuscript "Childhood gut microbiome is linked to mental health at school age via the functional connectome"
 
 Preprint can be found at: https://osf.io/preprints/psyarxiv/u9dw5 
+Supplemental materials for the preprint and a link to this repo can be found at: https://osf.io/unh6b/
 
 ## System Requirements
 This code has been tested on a MacBook Pro with MacOS Sequioa 15.01, running R version 4.2.3 in RStudio version 2022.07.2.   
