@@ -1,0 +1,3518 @@
+---
+title: "Childhood gut microbiome is linked to internalizing symptoms at school age via the functional connectome"
+author: "Fran Querdasi"
+post date: "2024-11-18"
+output: html_document
+---
+
+This version has been edited to add additional analyses for Nature Communications Reviews
+Line 306 reads in brain and cbcl sPLS inputs
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup
+## Set seed
+```{r}
+main.seed = 6024
+```
+
+## Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(mixOmics)
+  library(readxl)
+  library(vegan)
+  library(compositions)
+  library(mosaic)
+  library(Hmisc)
+  library(rstatix)
+  library(sjPlot)
+  library(patchwork)
+  library(corrplot)
+  library(MASS) # for box-cox transformation
+  library(mice) # for imputation of covariates
+  library(statip) 
+  library(lavaan) # for mediation model fit
+  library(sensemakr) # for partial r squared
+})
+```
+
+## Load data
+```{r}
+#load complete cases on brain and gut microbiome, and covariates
+sample <- read_csv("../../data/analysis_datasets/collab_jess_fran/complete_gusto_postnatalmh_brain_microbiome_20221104.csv") 
+
+#matrix of brain networks (Y matrix)
+brain <- read_csv( "../../data/analysis_datasets/collab_jess_fran/rsfc _values/6YO_network_rsfc_full.csv")
+
+#child internalizing outcome variables
+cbcl_y7 <- read_csv("../../data/child_beh/GUSTO_CBCL_scores_Y07_20220516.csv") %>% dplyr::select(
+  subID = subjid,
+  cbclintprobtot_y7
+)
+
+# cbcl Y7 raw internalizing variables to calculate alpha
+cbcl_raw_y7 <- read_excel("../../data/child_beh/GUSTO_Y07_CBCL_20200330.xlsx", sheet = "Raw Data") %>% dplyr::select(
+  subID = subjid,
+  cbclq5_y7,
+  cbclq14_y7,
+  cbclq29_y7,
+  cbclq30_y7,
+  cbclq31_y7,
+  cbclq32_y7,
+  cbclq33_y7,
+  cbclq35_y7,
+  cbclq42_y7,
+  cbclq45_y7,
+  cbclq47_y7,
+  cbclq49_y7,
+  cbclq50_y7,
+  cbclq51_y7,
+  cbclq52_y7,
+  cbclq54_y7,
+  cbclq56a_y7,
+  cbclq56b_y7,
+  cbclq56c_y7,
+  cbclq56d_y7,
+  cbclq56e_y7,
+  cbclq56f_y7,
+  cbclq56g_y7,
+  cbclq65_y7,
+  cbclq69_y7,
+  cbclq71_y7,
+  cbclq75_y7,
+  cbclq91_y7,
+  cbclq102_y7,
+  cbclq103_y7,
+  cbclq111_y7,
+  cbclq112_y7
+)
+``` 
+
+## Merge data
+```{r}
+#left join brain to the sample file
+brain_sample <- sample %>% left_join(brain, by = "subID")
+
+#consolidate alpha diversity metrics
+general_mb_path <- "../../data/microbiome/M24_M48/"
+shannon <- read_tsv(str_c(general_mb_path, "diversity_tsvs/M2448_shannon.tsv")) %>% 
+  dplyr::rename('#SampleID' = ...1)
+richness <- read_tsv(str_c(general_mb_path, "diversity_tsvs/M2448_richness.tsv"))  %>% 
+  dplyr::rename('#SampleID' = ...1)
+evenness <- read_tsv(str_c(general_mb_path, "diversity_tsvs/M2448_evenness.tsv"))  %>% 
+  dplyr::rename('#SampleID' = ...1)
+faith <- read_tsv(str_c(general_mb_path, "diversity_tsvs/M2448_faith.tsv")) %>% 
+  dplyr::rename('#SampleID' = ...1) 
+
+alpha_div <- shannon %>% left_join(richness, by = "#SampleID") %>% left_join(evenness, by = "#SampleID") %>% left_join(faith, by = "#SampleID")
+
+sample_ids <- sample %>% dplyr::select(subID, '#SampleID')
+
+alpha_div_sample <- sample_ids %>% left_join(alpha_div, by = "#SampleID")
+
+# merge clinical variables
+metadata <- sample %>% left_join(cbcl_y7, by = "subID")
+
+# write output files
+write_csv(brain_sample, "../../data/analysis_datasets/collab_jess_fran/spls_data/brain_input_spls.csv")
+write_csv(metadata, "../../data/analysis_datasets/collab_jess_fran/spls_data/clinvars_input_slsp.csv")
+write_csv(alpha_div_sample,  "../../data/analysis_datasets/collab_jess_fran/spls_data/alpha_div_sample.csv")
+```
+
+# Data Preprocessing
+
+## Create Genera and Taxonomy Combined File
+```{r}
+genus_otus_df = read_tsv("../../data/microbiome/M24_M48/input_files/genus_level/genus-table.tsv") #convert to df
+
+#provide name for first column, OTU number (for merging)
+genus_otus_df <- genus_otus_df %>% dplyr::rename(Feature.ID = `#OTU ID`)
+
+#join taxonomy file to microbe table to get taxa names for genera
+tax <- read.table("../../data/microbiome/M24_M48/input_files/M2448_taxonomy_edited.tsv", header=TRUE, sep = "\t")
+
+#filter out any genera that have 0 abundance in all samples
+genus_otus_df <-
+  genus_otus_df %>% 
+  mutate(
+    otu_abundance = rowSums(.[2:671])
+  )
+
+# how many genera have 0 abundance in this subsample?
+genus_otus_df %>% dplyr::count(otu_abundance==0) #30/353 genus-level taxa have 0 abundance across all samples
+
+#filter out genera with zero abunadnce in all samples (first filtering step, we will do more filtering once the dataset has been transposed below)
+genus_otus_df_filtered <- genus_otus_df %>% 
+  filter(otu_abundance > 0) %>% 
+  dplyr::select(-otu_abundance) #remove this column once you're done using it to filter
+
+#transpose this taxonomy feature file so that taxonomy are columns
+genus_otus_df_filtered_t <- as.data.frame(t(genus_otus_df_filtered))
+colnames(genus_otus_df_filtered_t) <- as.character(genus_otus_df_filtered_t[1,])
+genus_otus_df_filtered_t <- genus_otus_df_filtered_t[-1,]
+#genus_otus_df_filtered_t = setNames(data.frame(t(genus_otus_df_filtered[,-1])), genus_otus_df_filtered[,1])
+#convert all character values for otu counts to numeric
+genus_otus_df_filtered_test <- as.data.frame(lapply(genus_otus_df_filtered_t, as.numeric))
+Sample_IDs <- rownames(genus_otus_df_filtered_t)
+
+#name sample ID column for matching with metadata
+genus_otus_df_filtered_test <- cbind(Sample_IDs, genus_otus_df_filtered_test) %>% dplyr::rename('#SampleID' = Sample_IDs)
+
+#write new file combining taxonomy and genera counts as .tsv
+tax_features_ra_genus_fp <- "../../data/analysis_datasets/collab_jess_fran/maaslin2/inputs/genus_tax_otus_ra.tsv"
+#write_tsv(genus_otus_df_filtered_test, tax_features_ra_genus_fp)
+```
+
+## Offset and CLR Transform Microbiome Data
+Paper with special microbiome spls-da package and info on normalization to do beforehand: [https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0160169](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0160169), [http://mixomics.org/mixmc/](http://mixomics.org/mixmc/)
+
+http://mixomics.org/mixmc/mixmc-preprocessing/ -- followed steps there
+```{r}
+#gut microbiome table -- can read in from this step to avoid doing everything above
+#otus <- read_tsv("../../data/analysis_datasets/collab_jess_fran/maaslin2/inputs/genus_tax_otus_ra.tsv")
+otus <- genus_otus_df_filtered_test
+
+#offset the data so there are no 0s
+otus_offset <- otus %>% dplyr::select(-'#SampleID') + 1
+ids <- otus %>% dplyr::select('#SampleID')
+
+sum(which(otus_offset == 0))
+
+#calculate non-zero samples for each otu (for checking which number to filer on makes sense)
+non_zeros <- colSums(otus>0)
+hist(non_zeros) #most are below 50
+
+#pre-filtering to remove rare genera (keep genera for which sum of counts for that genera are above 5% of total counts in the entire dataset)
+#(NOTE: doing this in whole dataset rather than subsample w brain data)
+# tentatively decided on .05 as a cutoff 
+low.count.removal <- function(
+                        data, # genus count df of size n (sample) x p (genus)
+                        percent=0.05 # cutoff chosen
+                        ) 
+  {
+    keep.otu = which(colSums(data)*100/(sum(colSums(data))) > percent)
+    data.filter = data[,keep.otu]
+    return(list(data.filter = data.filter, keep.otu = keep.otu))
+}
+
+# call the function then apply on the offset data
+result.filter <- low.count.removal(otus_offset, percent=0.05)
+data.filter <- result.filter$data.filter
+
+# check the number of variables kept after filtering
+length(result.filter$keep.otu) #0.137 kept 50/353 features, 0.1385 keeps 50 features, .10 keeps 56 features, .05 keeps 64 features, .01 keeps 140 features
+
+#apply CLR transformation
+data.clr <- logratio.transfo(as.matrix(data.filter), 
+                             logratio = 'CLR', offset = 0) 
+#convert to dataframe
+class(data.clr) <- "matrix"
+data_clr <- as.data.frame(data.clr)
+
+#add IDs back
+data_clr_ids <- cbind(ids, data_clr)
+
+#write filtered dataset
+#write_csv(data_clr_ids, "../../data/analysis_datasets/collab_jess_fran/spls_data/otus_spls_input.csv")
+```
+
+## Read in data if you don't want to redo steps above
+```{r}
+# load datasets (run these lines if you don't want to re-run the processing steps from above)
+# gm data: data_clr_ids (64 gm features) -- add subID as id var, reduce to N=66 subsample
+data_clr_subids <- read_csv("../../data/analysis_datasets/collab_jess_fran/spls_data/otus_spls_input.csv") %>% left_join(metadata %>% dplyr::select(`#SampleID`, subID), by = "#SampleID") %>% dplyr::filter(!is.na(subID)) %>% 
+  dplyr::select(subID, everything(), -`#SampleID`)
+
+mb_ids <- data_clr_subids %>% dplyr::select(subID)
+mb_data_noids <- data_clr_subids %>% dplyr::select(-subID)
+
+# brain data: brain_input_spls.csv (93 brain networks)
+brain_input <- read_csv("../../data/analysis_datasets/collab_jess_fran/spls_data/brain_input_spls.csv") %>% 
+  dplyr::select(
+    subID,
+    DMN:MTL_PMN
+  )
+brain_ids <- brain_input %>% dplyr::select(subID)
+brain_data_noids <- brain_input %>% dplyr::select(-subID)
+
+# clinical variables together: metadata 
+# metadata_clinical_cont <- read_csv("../../data/analysis_datasets/collab_jess_fran/spls_data/clinvars_input_slsp.csv") %>% 
+#   dplyr::select(
+#     subID,
+#     cbclintprobtot_y7
+#   )
+# 
+# meta_clin_cont_ids <- metadata_clinical_cont %>% dplyr::select(subID)
+# 
+# #full metadata dataframe, including covariates, but only in analytic subsample
+# metadata_sample <- metadata_clinical_cont %>% 
+#   dplyr::select(subID) %>% 
+#   left_join(metadata, by = "subID")
+```
+
+## Shorten taxa names
+```{r}
+# assign rownames (ids) to mb and brain data
+rownames(mb_data_noids) <- mb_ids$subID
+rownames(brain_data_noids) <- brain_ids$subID
+
+#shorten mb names to be just genus (or family if genus not uniquely named) -- for plotting below
+split_mb_names <- str_split(colnames(mb_data_noids), "\\.")
+
+for (i in 1:length(colnames(mb_data_noids))){
+    if (grepl("UCG|Ruminiclostridium", split_mb_names[[i]][length(split_mb_names[[i]])-1])) { #if the phylum is UCG, then take genus and species 
+    colnames(mb_data_noids)[i] <- str_c(split_mb_names[[i]][length(split_mb_names[[i]])-1], split_mb_names[[i]][length(split_mb_names[[i]])], sep=".")
+    }
+  else if (grepl("__|[0-9]|uncultured|group", split_mb_names[[i]][length(split_mb_names[[i]])])) { #else if text after last dot (genus) is either a number or null or group...
+    colnames(mb_data_noids)[i] <- split_mb_names[[i]][length(split_mb_names[[i]])-1] #then take the phylum as the name
+    } 
+    else {
+    colnames(mb_data_noids)[i] <- split_mb_names[[i]][length(split_mb_names[[i]])] #if not, take the genus as the short name
+  }
+}
+
+# write the data with shortened taxa names for later use
+mb_data <- cbind(mb_ids, mb_data_noids)
+#write_csv(mb_data, "../../data/analysis_datasets/collab_jess_fran/spls_data/spls_mb_data_shortnames.csv")
+```
+
+# Analyses
+## Identification of Brain Signatures
+Brain --> Internalizing Symptoms sPLS1 models (X is matrix, Y is univariate)
+Vignette for sPLS1 regression models: https://mixomicsteam.github.io/mixOmics-Vignette/id_04.html#id_04:spls1 
+
+Note: data in spls are scaled by default 
+```{r}
+# select brain data in subsample that is complete on cbcl intprobs (55 ps) 
+cbcl_subs <- metadata %>% dplyr::filter(!is.na(cbclintprobtot_y7)) %>% dplyr::select(subID)
+brain_cbcl <- cbcl_subs %>% left_join(brain_input, by = "subID")
+
+brain_cbcl_ids <- brain_cbcl %>% dplyr::select(subID)
+brain_cbcl_noids <- brain_cbcl %>% dplyr::select(-subID)
+
+metadata_sample_cbcl <- metadata %>% dplyr::filter(!is.na(cbclintprobtot_y7))
+
+# initial sPLS model (should specify a large number of components first)
+tune.spls1.int.brain <- pls(X=brain_cbcl_noids, Y=metadata_sample_cbcl$cbclintprobtot_y7, ncomp=4, mode='regression')
+
+# use R^2 criterion to define the ideal number of dimensions/components (using repeated 10-fold cross validation)
+set.seed(main.seed)
+R2.spls1.int.brain <- perf(tune.spls1.int.brain, validation='Mfold',
+                           folds=10, nrepeat=50)
+
+plot(R2.spls1.int.brain, criterion = 'R2') # best is 2 components 
+
+cbclintprobtot_y7 <- metadata_sample_cbcl %>% dplyr::select(cbclintprobtot_y7)
+#write_csv(brain_cbcl_noids, "X_input.csv")
+#write_csv(cbclintprobtot_y7, "y_input.csv")
+
+# RUN THE FOLLOWING TO AVOID READING IN
+
+# read in X and Y datasets to avoid having to do everything above
+brain_cbcl_noids <- read_csv("X_input.csv") %>% dplyr::select(-contains("amyg"))
+cbclintprobtot_y7 <- read_csv("y_input.csv")
+
+# add a constant to all cbcl scores to avoid the error for tune.spls
+rownames(brain_cbcl_noids) <- brain_cbcl_ids$subID
+rownames(cbclintprobtot_y7) <- metadata_sample_cbcl$subID
+cbclintprobtot_y7$cbclintprobtot_y7 <- cbclintprobtot_y7$cbclintprobtot_y7 + 1
+
+# STOP RUNNING HERE
+
+# evaluate number of variables to select from X matrix (using number of components selected above)
+# set up list of values
+list.keepX <- c(5:10, seq(15, 50, 5)) # this should be thin at the start, and restricted to a small number of networks for a parsimonious model
+
+# use R^2 criterion to define the ideal number of dimensions/components (using repeated 10-fold cross validation)
+set.seed(main.seed)
+tune.spls1.brain.win.r2 <- mixOmics::tune.spls(brain_cbcl_win_noids, cbclintprobtot_y7, ncomp= 2, 
+                            test.keepX = list.keepX, 
+                            validation = 'Mfold', 
+                            folds = 10,
+                            nrepeat = 100, 
+                            progressBar = TRUE,
+                            measure = 'R2') 
+
+plot(tune.spls1.brain.win.r2) # best is 2 comps, first with 20 and second with 15 (like before) 
+
+#how many components to keep w this?
+choice.ncomp <- tune.spls1.brain.win.r2$choice.ncomp$ncomp #1
+# how many x variables with 1 component? 5
+choice.keepX <- tune.spls1.brain.win.r2$choice.keepX[1:choice.ncomp] #5 features
+choice.keepX_2 <- tune.spls1.brain.win.r2$choice.keepX[1:2] #50 features if we specify 2 components
+# for sake of parsimony, going with smaller number of components and features (not too much added gain)
+
+# specify final model with 1 component and 5 brain features
+spls1.int.brain <- spls(X=brain_cbcl_noids, Y=metadata_sample_cbcl$cbclintprobtot_y7, ncomp = choice.ncomp, keepX = choice.keepX, mode = "regression")
+
+# extract list of features that were selected (each component is orthogonal)
+selectVar(spls1.int.brain, comp = 1)$X$name 
+
+# extract component scores
+brain_cbcl <- as.data.frame(spls1.int.brain$variates$X) #outliers here are 010-21310 and 020-08045 
+
+# what proportion of variance in internalizing is explained by the brain component?
+spls1.int.brain$prop_expl_var$X #6% of the variance
+tune.spls1.int.brain$prop_expl_var$X #39% of variance explained by component 1 (more than pre-tuning)
+
+# plots of the results
+#plot the component associated to the  X data set (here corresponding to a linear combination of the selected genes) vs. the component associated to the y variable (corresponding to the scaled y variable in PLS1 with one dimension)
+
+plot(spls1.int.brain$variates$X, spls1.int.brain$variates$Y,
+     xlab = 'X component', ylab = 'y component / scaled y') #looks like some high outliers on X (4-6)
+
+cor(spls1.int.brain$variates$X, spls1.int.brain$variates$Y) #0.47
+```
+
+### Investigate and deal with brain outliers
+2 brain outliers showed up in the scatterplot with the components for internalizing
+```{r}
+# based on the component scores from the brain-internalizing spls regression, ID 010-21310 and 020-08045  appear to be high multivariate outliers
+
+brain_outliers <- brain_input %>% 
+  dplyr::filter(
+    subID == "010-21310" | subID == "020-08045"
+  )
+
+# get the ranges for all networks in the matrix
+brain_means <- as.data.frame(colMeans(brain_input[2:94]))
+
+# check distribution of each brain network -- on the whole, look relatively normal (some are slightly skewed)
+hist.data.frame(brain_input)
+# Calculate the variance of each variable
+variances <- sapply(brain_input, var)
+
+# Sort the variances from highest to lowest
+sorted_variances <- as.data.frame(sort(variances, decreasing = TRUE))
+colnames(sorted_variances) <- c("variance")
+sorted_variances <- sorted_variances %>% rownames_to_column(var = "variable")
+
+# Get the variable names corresponding to the sorted variances
+sorted_variable_names <- names(sorted_variances)
+
+
+# identify if the two multivariate outliers (010-21310 and 020-08045) are univariate outliers on any networks
+brain_input %>% 
+  pivot_longer(-subID) %>% #To make the data in long form required for `tidyverse`
+  group_by(name) %>% #Based on which column you want to aggregate 
+  identify_outliers(value) %>% 
+  select(name, subID, value, is.outlier, is.extreme) %>% # extreme = Q3 + 3*IQR, outlier = Q3 + 1.5*IQR
+  dplyr::filter(name %in% c("REW", "REW_MTL", "SAL_PMN", "SAL")) %>% 
+  dplyr::filter(subID=="010-21310" | subID=="020-08045") #these are exterme outliers on REW and REW_MTL
+
+# REW values are .8 and .63 (two highest values, next highest is .41), REW_MTL values are .76 and .69 (two highest values, next highest is .41)
+```
+
+### Added in reviews: Further outlier investigation
+Subs 010-21310 and 020-08045
+```{r}
+# test if those subs are outliers on any other variables
+
+# remove all character vars from the dataset to test continuous vars
+all_data_sample_cont <- all_data_sample %>% dplyr::select(subID, where(~ !is.character(.)) & where (~ !is.factor(.)))
+
+all_data_sample_cont %>% 
+  pivot_longer(-subID) %>% #To make the data in long form required for `tidyverse`
+  group_by(name) %>% #Based on which column you want to aggregate 
+  identify_outliers(value) %>% 
+  select(name, subID, value, is.outlier, is.extreme) %>% # extreme = Q3 + 3*IQR, outlier = Q3 + 1.5*IQR
+  dplyr::filter(subID=="010-21310" | subID=="020-08045")
+
+max(all_data_sample_cont$cbclanxprobtscore_y7)
+
+# values for categorical variables (bf, mother education, sex, ethnicity, birth method)
+# sex
+all_data_sample$sex_centered[all_data_sample$subID == "020-08045"] #1
+all_data_sample$sex_centered[all_data_sample$subID == "010-21310"] # 1
+
+# bf
+all_data_sample$deliv_mode_str[all_data_sample$subID == "010-21310"] # c-section
+all_data_sample$deliv_mode_str[all_data_sample$subID == "020-08045"] # vaginal
+
+# mother education
+all_data_sample$mother_edu_pw11[all_data_sample$subID == "020-08045"] # 3
+all_data_sample$mother_edu_pw11[all_data_sample$subID == "010-21310"] # 2
+
+all_data_sample$any_bf_months[all_data_sample$subID == "020-08045"] # missing
+all_data_sample$any_bf_months[all_data_sample$subID == "010-21310"] # missing
+
+# how many people didn't take antio or probiotics?
+all_data_sample %>% dplyr::count(antibio_M24!=1 & probiotics_M24!=1) # 47/55 didn't take either
+```
+
+### Create brain dataset with brain outliers winsorized to next highest values 
+RUN THE FOLLOWING AFTER READING IN
+```{r}
+# initialize a new dataset
+brain_cbcl_win <- cbind(brain_cbcl_ids, brain_cbcl_noids)
+
+# get the third highest REW value to replace the outliers with
+top_5_REW_values <- brain_cbcl_win %>% 
+  arrange(desc(REW)) %>% 
+  slice_head(n=5) %>% 
+  dplyr::select(REW)
+
+top_5_REW_values$REW[3]
+
+# replace both outlier sub's REW values with the third highest
+brain_cbcl_win$REW[brain_cbcl_win$subID=="010-21310"] <- top_5_REW_values$REW[3]
+brain_cbcl_win$REW[brain_cbcl_win$subID=="020-08045"] <- top_5_REW_values$REW[3]
+
+# get the third higest REW_MTL values to replace outliers with
+top_5_REW.MTL_values <- brain_cbcl_win %>% 
+  arrange(desc(REW_MTL)) %>% 
+  slice_head(n=5) %>% 
+  dplyr::select(REW_MTL)
+
+top_5_REW.MTL_values$REW_MTL[3]
+
+brain_cbcl_win$REW_MTL[brain_cbcl_win$subID=="010-21310"] <- top_5_REW.MTL_values$REW_MTL[3]
+brain_cbcl_win$REW_MTL[brain_cbcl_win$subID=="020-08045"] <- top_5_REW.MTL_values$REW_MTL[3]
+```
+
+### Tune the Brain --> Internalizing Symptoms sPLS models with the winsorized dataset
+
+```{r}
+brain_cbcl_win_noids <- brain_cbcl_win %>% dplyr::select(-subID)
+rownames(brain_cbcl_win_noids) <- brain_cbcl_ids$subID
+
+# initial sPLS model (should specify a large number of components first)
+tune.spls1.int.brain.win <- pls(X=brain_cbcl_win_noids, Y=metadata_sample_cbcl$cbclintprobtot_y7, ncomp=4, mode='regression')
+
+# use R^2 criterion to define the ideal number of dimensions/components (using repeated 10-fold cross validation)
+set.seed(main.seed)
+tune.spls1.brain.win.r2 <- mixOmics::tune.spls(brain_cbcl_win_noids, cbclintprobtot_y7, ncomp= 2, 
+                            test.keepX = list.keepX, 
+                            validation = 'Mfold', 
+                            folds = 10,
+                            nrepeat = 100, 
+                            progressBar = TRUE,
+                            measure = 'R2') 
+
+plot(tune.spls1.brain.win.r2) # best is 2 comps, first with 20 and second with 15 (like before) 
+
+#how many components to keep w this?
+choice.ncomp.r2 <- tune.spls1.brain.win.r2$choice.ncomp$ncomp 
+choice.keepX.r2 <- tune.spls1.brain.win.r2$choice.keepX[1:1] #20 features
+choice.keepX_2.r2 <- tune.spls1.brain.win.r2$choice.keepX[1:2] #20 features comp1, 15 comp2 
+
+# specify final model with same number of features as before 
+spls1.int.brain.win <- spls(X=brain_cbcl_win_noids, Y=metadata_sample_cbcl$cbclintprobtot_y7, ncomp = 2, keepX = choice.keepX_2.r2, mode = "regression")
+
+# extract list of features that were selected (each component is orthogonal)
+selectVar(spls1.int.brain.win, comp = 1)$X$name #  "REW"     "SAL_PMN" "REW_MTL" "SAL"     "MTL"     "SAL_SMD" "CON_PMN" "SAL_AUD" "VAN_PMN" "DMN_SAL" "SAL_SML" "SAL_VAN" "MTL_PMN" "DMN_MTL" "CON_SMD" "DMN_REW" "SAL_DAN" "DAN_VIS" "VIS_SMD" "SAL_CON"
+selectVar(spls1.int.brain.win, comp = 2)$X$name #"VIS_REW" "DMN_REW" "VAN_SMD" "FPN_REW" "VAN_REW" "CON_REW" "SMD_SML" "DAN_SML" "VAN_MTL" "DAN_VAN" "REW_PMN" "DMN"     "VIS_PMN" "DAN_REW" "DMN_CON"
+
+# plot the loadings for each feature
+brain.int.win_loadings_c1 <- selectVar(spls1.int.brain.win, comp=1)$X$value %>% rownames_to_column(var = "network")
+colnames(brain.int.win_loadings_c1)[2] <- "loading_C1"
+
+brain.int.win_loadings_c2 <- selectVar(spls1.int.brain.win, comp=2)$X$value %>% rownames_to_column(var = "network")
+colnames(brain.int.win_loadings_c2)[2] <- "loading_C2"
+
+# determine the variable importance (loading magnitude weighted by variance explained?)
+vip.spls1.int.brain.win <- vip(spls1.int.brain.win)
+vip.spls1.int.brain.win[selectVar(spls1.int.brain.win, comp=1)$X$name, 1] # 10 variables with VIP above 1 in comp 1
+vip.spls1.int.brain.win[selectVar(spls1.int.brain.win, comp=2)$X$name, 2] # 8 variables with VIP above 1 in comp 2
+
+# what proportion of variance in microbiome is explained by each component
+spls1.int.brain.win$prop_expl_var$X #17% explained by comp 1, 32% by comp 2
+spls1.int.brain.win$prop_expl_var$Y
+
+# plots of the results
+plot(spls1.int.brain.win$variates$X, spls1.int.brain.win$variates$Y,
+     xlab = 'X component', ylab = 'y component / scaled y') #
+
+cor(spls1.int.brain.win$variates$X, spls1.int.brain.win$variates$Y) #comp1 x and y are correlated at 47, comp2 at .38
+
+# extract component scores
+brain.int.win.comp_scores <- as.data.frame(spls1.int.brain.win$variates$X) %>% 
+  dplyr::rename(brain_int_win_comp1 = comp1,
+                brain_int_win_comp2 = comp2) %>% 
+  rownames_to_column(var="subID")
+
+# correlation p-values
+cor.test(brain.int.win.comp_scores$brain_int_win_comp1, metadata_sample_cbcl$cbclintprobtot_y7) # p = .00026
+cor.test(brain.int.win.comp_scores$brain_int_win_comp2, metadata_sample_cbcl$cbclintprobtot_y7) # p = .0121
+
+# save the loadings and vips, combining component 1 and component 2
+brain_loadings <- selectVar(spls1.int.brain.win, comp=1)$X$value %>% rownames_to_column(var = "network") 
+colnames(brain_loadings) <- c("network", "loading")
+brain_vip<- as.data.frame(vip.spls1.int.brain.win[selectVar(spls1.int.brain.win, comp=1)$X$name, 1]) %>% rownames_to_column(var="network")
+colnames(brain_vip) <- c("network", "vip")
+
+brain_load_vip_c1 <- brain_loadings %>% left_join(brain_vip, by = "network") %>% dplyr::mutate(loading = signif(loading, 2), vip = signif(vip, 2), signature = "SOFA Intra-Network")
+
+
+brain_loadings_c2 <- selectVar(spls1.int.brain.win, comp=2)$X$value %>% rownames_to_column(var = "network") 
+colnames(brain_loadings_c2) <- c("network", "loading")
+
+brain_vip_c2 <- as.data.frame(vip.spls1.int.brain.win[selectVar(spls1.int.brain.win, comp=2)$X$name, 2]) %>% rownames_to_column(var="network")
+colnames(brain_vip_c2) <- c("network", "vip")
+
+brain_load_vip_c2 <- brain_loadings_c2 %>% left_join(brain_vip_c2, by = "network") %>% dplyr::mutate(loading = signif(loading, 2), vip = signif(vip, 2), signature = "SOFA Inter-Network")
+
+# changed with adding of stability values, below
+#brain_load_vip_comb <- brain_load_vip_c1 %>% bind_rows(brain_load_vip_c2) %>% dplyr::select(network, signature, everything())
+#write_csv(brain_load_vip_comb, "tables/TableS2.csv")
+```
+
+### Added in Reviews: Determine Stability of each Selected Feature on Brain Signatures
+```{r}
+set.seed(main.seed)
+perf.spls1.int.brain.win <- perf(spls1.int.brain.win, validation = "Mfold", folds = 10, nrepeats = 100)
+
+# extract stability values
+stab.spls1.int.brain.win.comp1 <- perf.spls1.int.brain.win$features$stability.X$comp1
+extr.stab.spls1.int.brain.win.comp1 <- as.data.frame(stab.spls1.int.brain.win.comp1[selectVar(spls1.int.brain.win, comp=1)$X$name]) %>% rownames_to_column(var="network")
+colnames(extr.stab.spls1.int.brain.win.comp1) <- c("network", "stability")
+
+# average stability in comp 1
+sum(extr.stab.spls1.int.brain.win.comp1$stability) / nrow(extr.stab.spls1.int.brain.win.comp1) # 0.795
+
+stab.spls1.int.brain.win.comp2 <- perf.spls1.int.brain.win$features$stability.X$comp2
+extr.stab.spls1.int.brain.win.comp2 <- as.data.frame(stab.spls1.int.brain.win.comp2[selectVar(spls1.int.brain.win, comp=2)$X$name]) %>% rownames_to_column(var="network")
+colnames(extr.stab.spls1.int.brain.win.comp2) = c("network", "stability")
+
+# average stability in comp 2
+sum(extr.stab.spls1.int.brain.win.comp2$stability) / nrow(extr.stab.spls1.int.brain.win.comp2) # 0.64
+
+# add stability values into dfs with loadings and vips
+brain_load_vip_c1 <- brain_load_vip_c1 %>% left_join(extr.stab.spls1.int.brain.win.comp1, by = "network") %>% dplyr::select(network, loading, vip, stability, signature)
+
+brain_load_vip_c2 <- brain_load_vip_c2 %>% left_join(extr.stab.spls1.int.brain.win.comp2, by = "network") %>% dplyr::select(network, loading, vip, stability, signature)
+
+brain_load_vip_comb_r1 <- brain_load_vip_c1 %>% bind_rows(brain_load_vip_c2) 
+write_csv(brain_load_vip_comb_r1, "tables/TableS2_R1.csv")
+```
+
+### Plot Final Brain --> Internalizing Symptoms sPLS Model Loadings
+```{r}
+# plot loadings using dataframes for the added flexibility of ggplot
+# create a factor that sorts the loadings by magnitude 
+brain.int.win_loadings_c1$network <- factor(brain.int.win_loadings_c1$network, levels = brain.int.win_loadings_c1$network[order(brain.int.win_loadings_c1$loading_C1, decreasing = TRUE)])
+
+brain.int.win_loadings_c2$network <- factor(brain.int.win_loadings_c2$network, levels = brain.int.win_loadings_c2$network[order(brain.int.win_loadings_c2$loading_C2, decreasing = TRUE)])
+
+# wherever there is "REW", replace with "SOFA" (more accurate name actually used in Seitzman 2020)
+brain.int.win_loadings_c1$network <- str_replace(brain.int.win_loadings_c1$network, "REW", "SOFA")
+brain.int.win_loadings_c2$network <- str_replace(brain.int.win_loadings_c2$network, "REW", "SOFA")
+
+# graph the 10 highest loadings by magnitude, with vip > 1
+brain_c1 <- ggplot(brain.int.win_loadings_c1 %>% slice_max(., n=10, order_by=abs(loading_C1)), aes(x = reorder(network, loading_C1), y = loading_C1)) +
+  geom_col(fill = '#95cacb') + 
+  coord_flip() +
+  ylab("Loading") + xlab("Brain Network") +
+  labs(tag = "A") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=6), axis.text.y = element_text(color="black", size=6), axis.title = element_text(size=7), plot.tag=element_text(size=7)) +
+  ggtitle("SOFA, MTL, SAL, PMN
+  Network Signature") +
+  theme(plot.title = element_text(hjust=0.5, size=7, face='bold'))
+
+# graph comp2 loadings iwth vip > 1
+brain_c2 <- ggplot(brain.int.win_loadings_c2 %>% slice_max(., n=8, order_by=abs(loading_C2)), aes(x = reorder(network, loading_C2), y = loading_C2)) +
+  geom_col(fill = '#fd988d') + 
+  coord_flip() +
+  ylab("Loading") + xlab("Brain Network") +
+  labs(tag = "C") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=6), axis.text.y = element_text(color="black", size=6), axis.title = element_text(size=7), plot.tag=element_text(size=7)) +
+  ggtitle("SOFA Between Network 
+  Signature") +
+  theme(plot.title = element_text(hjust=0.5, size=7, face='bold'))
+
+# use patchwork package to arrange the plots next to each other
+brain_c1 + brain_c2
+
+ggsave('figures/Figure1.png', brain_c1 + brain_c2, width = 9, height=5, dpi=1000)
+
+# write data for source data files
+fig_1a <- brain.int.win_loadings_c1 %>% slice_max(., n=10, order_by=abs(loading_C1)) %>% arrange(desc(loading_C1))
+fig_1c <- brain.int.win_loadings_c2 %>% slice_max(., n=8, order_by=abs(loading_C2)) %>% arrange(desc(loading_C2))
+
+write_csv(fig_1a, "../../manuscripts/fran_jess_microbiome_brain/Nature Communications Submission/R2 Final Materials/Source Data Files/fig1a.csv")
+write_csv(fig_1c, "../../manuscripts/fran_jess_microbiome_brain/Nature Communications Submission/R2 Final Materials/Source Data Files/fig1c.csv")
+```
+
+### Get brain network means, variances, and range
+```{r}
+# calculate means and sds 
+brain_means <- brain_cbcl_win_noids %>% 
+  summarise_all(mean)
+
+brain_sds <- brain_cbcl_win_noids %>% 
+  summarise_all(sd)
+
+brain_mins <- brain_cbcl_win_noids %>% 
+  summarise_all(min)
+
+brain_maxes <- brain_cbcl_win_noids %>% 
+  summarise_all(max)
+
+# reshape the dataframe
+means <- brain_means %>% pivot_longer(
+  cols = everything(),
+  names_to = 'network',
+  values_to = 'mean'
+)
+
+sds <- brain_sds %>% pivot_longer(
+  cols = everything(),
+  names_to = 'network',
+  values_to = 'sd'
+) 
+
+mins <- brain_mins %>% pivot_longer(
+  cols = everything(),
+  names_to = 'network',
+  values_to = 'min'
+) 
+
+maxes <- brain_maxes %>% pivot_longer(
+  cols = everything(),
+  names_to = 'network',
+  values_to = 'max'
+) 
+
+summary <- means %>% full_join(sds, by = "network") %>% full_join(mins, by = "network") %>% full_join(maxes, by = "network")
+
+write_csv(summary, "brain_network_descriptives.csv")
+```
+
+## Covariates
+Now that we have the brain signature component scores, we can line up covariates for the regression models. 
+a-priori covariates: sex, gestational age, birthweight, mean FD, delivery mode
+Selection is on diet covariates since we have a lot of them
+
+### Added in Reviews: Read in additional covariates, other mental health domains
+Family income-to-needs ratio: income per household member (GUSTO_income_clean_20220803)
+
+parental depression: BDI at y6, STAI state at y6 (GUSTO_BDISTAI_imputed_scores_20210507)
+* z-score each, then average (so that scales are still in standardized units) to create mental health composite (Uy, 2023)
+* report on % reporting clinical levels of each (STAI-s cutoff = 40, BDI = minimal (0-13), mild (14-19), moderate (20-28), severe (29-63))
+
+Side note: "averaging the z-scores of each individual score is generally preferred over simply adding them because it gives equal weight to each questionnaire item, regardless of its original scale, and prevents a single outlier from heavily influencing the composite score" (https://pmc.ncbi.nlm.nih.gov/articles/PMC8826187/)
+
+CBCL externalizing, anxiety problems, depressive problems; All CBCL scales, t-scores (GUSTO_CBCL_scores_Y07_20220516)
+
+Other variables to report on: 
+antibiotics and probiotics (yes/no; GUSTO_M24_biotics_clean_20220803)
+medication use (M24 Child Health medications_FormA515_20220214)
+maternal education (prenatal week 11) -- in Demo_Feed_Birth_FormA752_20240417.xlsx, MEW01EDUC, MEW01UNIC
+```{r}
+# read in additional data
+income <- read_csv("../../data/general_covariates/GUSTO_income_clean_20220803.csv") %>% 
+  dplyr::rename(subID = subjid)
+
+maternal_mh <- read_csv("../../data/mh_trajectories/GUSTO_BDISTAI_imputed_scores_20210507.csv") %>% 
+  dplyr::select(
+    subID = subjid,
+    BDI2_prorated_score_yr6,
+    STAI_prorated_state_yr6
+  ) %>% 
+  dplyr::mutate(
+    STAI_clinical_yr6 = ifelse(STAI_prorated_state_yr6 > 40, 1, 0),
+    BDI2_class_yr6 = case_when(
+      BDI2_prorated_score_yr6 < 14 ~ "minimal",
+      BDI2_prorated_score_yr6 >= 14 & BDI2_prorated_score_yr6 < 20 ~ "mild",
+      BDI2_prorated_score_yr6 >= 20 & BDI2_prorated_score_yr6 < 29 ~ "moderate",
+      BDI2_prorated_score_yr6 >= 29 ~ "severe"
+    ),
+    STAI_Z_yr6 = (STAI_prorated_state_yr6 - mean(STAI_prorated_state_yr6,na.rm=T))/sd(STAI_prorated_state_yr6,na.rm=T),
+    BDI_Z_yr6 = (BDI2_prorated_score_yr6 - mean(BDI2_prorated_score_yr6,na.rm=T)/sd(BDI2_prorated_score_yr6,na.rm=T))
+  )
+
+maternal_mh$maternalmh_zscore_composite_yr6 = maternal_mh %>%
+  dplyr::select(., STAI_Z_yr6,BDI_Z_yr6) %>% 
+  rowMeans(na.rm=T)
+
+# additional cbcl data
+additional_cbcl <- read_csv("../../data/child_beh/GUSTO_CBCL_scores_Y07_20220516.csv") %>% 
+  dplyr::select(
+    subID = subjid,
+    cbclintprobtscore_y7,
+    cbclextprobtot_y7,
+    cbclextprobtscore_y7,
+    cbcldepprobtot_y7,
+    cbcldepprobtscore_y7,
+    cbclanxprobtot_y7,
+    cbclanxprobtscore_y7
+  )
+
+# antibiotics, probiotics
+biotics <- read_csv("../../data/mb_covariates/GUSTO_M24_biotics_clean_20220803.csv") %>% 
+  dplyr::rename(
+    subID = subjid
+  )
+
+# other medications
+meds <- readxl::read_xlsx("../../data/mb_covariates/M24 Child Health medications_FormA515_20220214.xlsx") %>% 
+  dplyr::rename(subID = SubjectID)
+
+# maternal education
+edu <- readxl::read_xlsx("../../Shiba/data/Demo_Feed_Birth_FormA752_20240417.xlsx") %>% 
+  dplyr::select(
+    subID = SubjectID,
+    mother_edu_pw11 = MEW01EDUC,
+    mother_univ_pw11 = MEW01UNIC
+  )
+
+# child self-reported symptoms
+dep_self <- read_xlsx("../../Shiba/data/other ND data/GUSTO_Y08.5_CDI2_20210908.xlsx") %>% 
+  dplyr::select(
+    subID = subjid,
+    usability,
+    cdi2_tot_y8 = cdi2_totraw
+  ) %>% 
+  dplyr::filter(usability == "usable") %>% 
+  dplyr::mutate(
+    CDI_Z_yr8 = (cdi2_tot_y8 - mean(BDI2_prorated_score_yr6,na.rm=T)/sd(BDI2_prorated_score_yr6,na.rm=T))
+  )
+
+anx_self <- read_xlsx("../../Shiba/data/other ND data/GUSTO_Y08.5_MASC2_20220218.xlsx") %>% 
+  dplyr::select(
+    subID = subjid,
+    usability,
+    masc2_tot_y8 = masc2_totraw
+  ) %>% 
+  dplyr::filter(usability == "usable")
+
+# merge component scores with rest of dataset
+metadata_comp <- metadata %>% left_join(brain.int.win.comp_scores, by = "subID") 
+
+# merging new covariates with rest of dataset is done at bottom of next chunk
+```
+
+### Read in additional (diet) covariates
+```{r}
+diet <- read_csv("../../data/mb_covariates/diet_covariates.csv") %>% 
+  dplyr::rename(subID = subjid)
+
+# correlations between diet covariates
+diet_m <- diet %>% dplyr::select(-subID)
+testRes = cor.mtest(diet_m, conf.level = 0.95)
+M = cor(diet_m)
+corrplot(M, p.mat = testRes$p, sig.level = 0.05, order = 'hclust', addrect = 2)
+# some clusters: CHO and fat (-), DQI, protein, fiber (+)
+
+# correlation with brain component scores and alpha div
+diet_omics_m <- metadata_comp %>% dplyr::select(subID, contains("win"), cbclintprobtot_y7, any_bf_months) %>% left_join(alpha_div_sample, by = "subID") %>% left_join(diet, by = "subID") %>% dplyr::select(-`#SampleID`, -subID) %>% drop_na() %>% dplyr::select(-contains("DQI"), -any_bf_months) %>% dplyr::rename(
+  "SOFA, MTL, SAL, PMN Between Network Signature" = brain_int_win_comp1,
+  "SOFA Between Network Signature" = brain_int_win_comp2,
+  "Internalizing Symptoms" = cbclintprobtot_y7,
+  "Shannon Index" = shannon_entropy,
+  "Observed Features" = observed_features,
+  "Pielou Evenness" = pielou_evenness,
+  "Faith's PD" = faith_pd,
+  "Protein" = `Protein_%energy`,
+  "Total Fat" = `Fat_%energy`,
+  "Carbs" = `CHO_%energy`,
+  "Fiber" = Fibre.per.1000kcal,
+  "Saturated Fat" = `SatFat_%`,
+  "MUFA" = `MUFA_%`,
+  "PUFA" = `PUFA_%`
+)
+
+testRes1 = cor.mtest(diet_omics_m, conf.level = 0.95)
+M1 = cor(diet_omics_m)
+# only significant association with alpha div is fiber + related to shannon entropy and observed features, brain comp2 is - related to fat % energy and + related to cho % energy, internalizing is + related to PUFA
+
+corrplot(M1,
+         method="color",
+         type="lower",
+         diag=TRUE,
+         p.mat = testRes1$p,
+         insig = "label_sig",
+         sig.level = c(.001, .01, .05),
+         pch.cex = 0.8,
+         pch.col = "yellow",
+         tl.col="black",
+         tl.cex=0.8,
+         addCoef.col = "black",
+         tl.pos="lt",
+         cl.pos="r",
+         outline=TRUE) 
+
+# can't figure out how to save this besides taking a picture of output
+
+cor.test(diet_m$`Fat_%energy`, diet_m$Fibre.per.1000kcal) # cor is -0.25 (not too strong to put both in regression)
+cor.test(diet_m$`Fat_%energy`, diet_m$`CHO_%energy`) #cor is -0.86 -- collinear, choose 1 to put in regression (fat has higher magnitude of correlation with brain comp so put that one)
+cor.test(diet_m$`Fat_%energy`, diet_m$`PUFA_%`) # cor is -0.28 
+cor.test(diet_m$Fibre.per.1000kcal, diet_m$`PUFA_%`) # very small correlation 
+
+# add dataset with standard covariates
+braincomp_alpha_covs <- metadata_comp %>% dplyr::select(-observed_features) %>% left_join(alpha_div_sample, by = "subID") %>% left_join(diet, by = "subID") %>% dplyr::select(-contains("Sample")) 
+
+# make bf into ordered factor
+braincomp_alpha_covs$any_bf_months <- factor(braincomp_alpha_covs$any_bf_months, levels = c("1M_to_3M", "3M_to_6M", "6M_to_12M", ">12M"))
+
+# breastfeeding associations with brain/int components, internalizing, or alpha diversity: anovas
+summary(aov(brain_int_win_comp1~any_bf_months, data=braincomp_alpha_covs)) 
+summary(aov(brain_int_win_comp2~any_bf_months, data=braincomp_alpha_covs)) #ns
+summary(aov(cbclintprobtot_y7~any_bf_months, data=braincomp_alpha_covs)) #ns
+summary(aov(shannon_entropy~any_bf_months, data=braincomp_alpha_covs))
+summary(aov(observed_features.x~any_bf_months, data=braincomp_alpha_covs))
+summary(aov(pielou_evenness~any_bf_months, data=braincomp_alpha_covs))
+summary(aov(faith_pd~any_bf_months, data=braincomp_alpha_covs))
+
+# is breastfeeding correlated with any diet vars we have selecte?
+summary(aov(`PUFA_%`~any_bf_months, data=braincomp_alpha_covs)) # 
+summary(aov(`Fat_%energy`~any_bf_months, data=braincomp_alpha_covs)) #ns
+summary(aov(Fibre.per.1000kcal  ~any_bf_months, data=braincomp_alpha_covs)) #ns
+
+# birth method associations with brain/int components, internalizing, or alpha diversity: t-tests
+t.test(braincomp_alpha_covs$deliv_mode, braincomp_alpha_covs$brain_int_noamyg_win_comp1) # ns
+t.test(braincomp_alpha_covs$deliv_mode, braincomp_alpha_covs$brain_int_noamyg_win_comp2)
+t.test(braincomp_alpha_covs$deliv_mode, braincomp_alpha_covs$cbclintprobtot_y7) #  
+
+# is birth method associated with any diet vars we have selected?
+t.test(braincomp_alpha_covs$deliv_mode, braincomp_alpha_covs$`PUFA_%`)
+
+# how many infants are in each breastfeeding category?
+braincomp_alpha_covs %>% dplyr::filter(!is.na(cbclintprobtot_y7)) %>% dplyr::count(any_bf_months) # roughly 1/4 were still gettin breastmilk after a year
+
+# is GA and BW related to each other?
+cor.test(braincomp_alpha_covs$GA_centered, braincomp_alpha_covs$BW_centered) # yes
+
+# we want to add diet covariates to the regression with brain and internalizing, bc 1) Fat is related to brain and PUFA is related to internalizing, 2) we want to keep largely same covariate set for each analysis
+
+# add the additional covariates (household income per member, maternal mh composite)
+# merge these vars with the overall data
+braincomp_alpha_covs_add <- braincomp_alpha_covs %>% left_join(income, by = "subID") %>% left_join(edu, by = "subID") %>% left_join(maternal_mh, by = "subID") %>% left_join(additional_cbcl, by = "subID") %>% left_join(biotics, by = "subID") %>% left_join(meds, by = "subID")
+
+t.test(monthly_income_per_member~mother_univ_pw11, data=braincomp_alpha_covs_add) # t = 34.9, p < .001 so we'll only include income
+effectsize::cohens_d(monthly_income_per_member~mother_univ_pw11, data=braincomp_alpha_covs_add)
+```
+
+### Added in reviews: corrplot saving block
+Need to put this code in a separate block in order for the image to save
+
+Every time, before running this, to get the significance * to not overlap the text:
+Change the place_points function within the corrplot function. To do so, run:
+
+trace(corrplot, edit=TRUE)
+
+Then replace on line 443
+
+place_points = function(sig.locs, point) {
+  text(pos.pNew[, 1][sig.locs], pos.pNew[, 2][sig.locs], 
+       labels = point, col = pch.col, cex = pch.cex, 
+       lwd = 2)
+with:
+place_points = function(sig.locs, point) {
+      text(pos.pNew[, 1][sig.locs], (pos.pNew[, 2][sig.locs])+0.25, 
+           labels = point, col = pch.col, cex = pch.cex, 
+           lwd = 2)
+           
+and then hit the "Save" button.
+```{r}
+# Initialize file path (using PDF instead of PNG because PDF is automatically higher resolution)
+pdf("figures/FigureS1_NatCommsR1.pdf")
+
+# Your function to plot image goes here
+corrplot(M1,
+         method="color",
+         type="lower",
+         diag=TRUE,
+         p.mat = testRes1$p,
+         insig = "label_sig",
+         sig.level = c(.001, .01, .05),
+         pch.cex = 0.4,
+         number.cex=0.6, # change size of numbers in boxes
+         pch.col = "yellow",
+         tl.col="black",
+         tl.cex=0.6,
+         addCoef.col = "black",
+         tl.pos="lt",
+         cl.pos="r",
+         outline=TRUE,
+         mar=c(2, 0, 1, 0)) 
+
+# Then
+dev.off()
+```
+
+
+### Missing data rates for covariates
+```{r}
+# get analytic sample with cbcl, brain, and gm
+sample_braincomp_alpha_covs <- braincomp_alpha_covs_add %>% dplyr::filter(!is.na(cbclintprobtot_y7))
+
+# count number missing on each covariate: ga, bw, sex, delivery mode, diet, breastfeeding
+sample_braincomp_alpha_covs %>% dplyr::count(is.na(sex_centered)) # complete
+sample_braincomp_alpha_covs %>% dplyr::count(is.na(GA_centered)) # complete
+sample_braincomp_alpha_covs %>% dplyr::count(is.na(BW_centered)) # complete
+sample_braincomp_alpha_covs %>% dplyr::count(is.na(deliv_mode_str)) # complete
+sample_braincomp_alpha_covs %>% group_by(is.na(Fibre.per.1000kcal)) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) #43/55 have diet data (78%)
+sample_braincomp_alpha_covs %>% dplyr::count(is.na(any_bf_months)) # 53/55 (4% missing)
+
+# new covariates: household income per member, maternal mh composite
+sample_braincomp_alpha_covs %>% dplyr::count(is.na(monthly_income_per_member)) # 4 missing
+sample_braincomp_alpha_covs %>% dplyr::count(is.na(maternalmh_zscore_composite_yr6)) # 8 missing
+sample_braincomp_alpha_covs %>% dplyr::count(is.na(mother_univ_pw11)) # 5 missing
+
+# n complete on all covariates (was 43) -- now 34 (dropped 9)
+sample_braincomp_alpha_covs %>% dplyr::count(!is.na(sex_centered) & !is.na(BW_centered) & !is.na(deliv_mode) & !is.na(`PUFA_%`) & !is.na(`Fat_%energy`) & !is.na(meanFD_centered) & !is.na(monthly_income_per_member) & !is.na(maternalmh_zscore_composite_yr6) & !is.na(mother_univ_pw11))
+
+# use mice with agnostic mi to generate imputations for missing covariate values (all)
+df_impute_smaller <- sample_braincomp_alpha_covs %>% dplyr::select(
+  subID,
+  meanFD_centered,
+  sex_centered,
+  GA_centered,
+  BW_centered,
+  any_bf_months, # incomp
+  deliv_mode,
+  Fibre.per.1000kcal, # incomp
+  `Fat_%energy`, # incomp
+  `PUFA_%`, # incomp
+  monthly_income_per_member, # incomp
+  maternalmh_zscore_composite_yr6, # incomp
+  mother_edu_pw11 # incomp
+) %>% 
+  dplyr::mutate(
+    maternalmh_zscore_composite_yr6 = ifelse(is.nan(maternalmh_zscore_composite_yr6), NA_real_, maternalmh_zscore_composite_yr6)
+  )
+
+# clean up dataset formatting so mice runs
+rownames(df_impute_smaller) <- df_impute_smaller$subID
+df_impute_smaller$subID <- NULL
+colnames(df_impute_smaller) <- gsub("%", "Percent", colnames(df_impute_smaller))
+
+imp <- mice(df_impute_smaller, seed=123, m = 40, maxit = 20)
+imp$loggedEvents
+# no logged events
+
+cov_imputed_long <- mice::complete(imp, action = "long")
+cov_imputed_wide <- reshape(cov_imputed_long, idvar = ".id", timevar = ".imp", direction = "wide")
+row.names(cov_imputed_wide) <- row.names(df_impute_smaller)
+
+# create a matrix with a column for each variable to be imputed and 1 row per participant id
+df1 <- data.frame(matrix(NA, nrow = nrow(cov_imputed_wide), ncol = 7))
+row.names(df1) <- row.names(cov_imputed_wide) 
+
+# assign values for each var for each participant that is the median or most frequent imputation 
+# (non-missing values will be the observed value)
+colnames(df1) <- c("any_bf_months", "Fat_%energy", "PUFA_%", "monthly_income_per_member", "maternalmh_zscore_composite_yr6", "mother_edu_pw11", "Fibre.per.1000kcal")
+df1[,1] <- apply(cov_imputed_wide[,grepl("any_bf_months", colnames(cov_imputed_wide))],1, mfv1) # if there are 2 most frequent values, it takes the first
+df1[,2] <- apply(cov_imputed_wide[,grepl("Fat_Percentenergy", colnames(cov_imputed_wide))],1,median)
+df1[,3] <- apply(cov_imputed_wide[,grepl("PUFA_Percent", colnames(cov_imputed_wide))], 1, median)
+df1[,4] <- apply(cov_imputed_wide[,grepl("monthly_income_per_member", colnames(cov_imputed_wide))], 1, median)
+df1[,5] <- apply(cov_imputed_wide[,grepl("maternalmh_zscore_composite_yr6", colnames(cov_imputed_wide))], 1, median)
+df1[,6] <- apply(cov_imputed_wide[,grepl("mother_edu_pw11", colnames(cov_imputed_wide))], 1, mfv)
+df1[,7] <- apply(cov_imputed_wide[,grepl("Fibre.per.1000kcal", colnames(cov_imputed_wide))], 1, median)
+
+# Identify the missing row and replace with the imputed rows for those columns
+all.equal(row.names(df_impute_smaller), row.names(df1))
+
+sample_braincomp_alpha_covs_imputed <- sample_braincomp_alpha_covs
+
+sample_braincomp_alpha_covs_imputed$any_bf_months <- df1$any_bf_months
+sample_braincomp_alpha_covs_imputed$`PUFA_%` <- df1$`PUFA_%`
+sample_braincomp_alpha_covs_imputed$`Fat_%energy` <- df1$`Fat_%energy`
+sample_braincomp_alpha_covs_imputed$monthly_income_per_member <- df1$monthly_income_per_member
+sample_braincomp_alpha_covs_imputed$maternalmh_zscore_composite_yr6 <- df1$maternalmh_zscore_composite_yr6
+sample_braincomp_alpha_covs_imputed$mother_edu_pw11 <- df1$mother_edu_pw11
+sample_braincomp_alpha_covs_imputed$Fibre.per.1000kcal <- df1$Fibre.per.1000kcal
+
+write.csv(sample_braincomp_alpha_covs_imputed, "metadata_comp_covs_imputed.csv")
+
+# create maternal education university or lower with imputed datda
+sample_braincomp_alpha_covs_imputed <- sample_braincomp_alpha_covs_imputed %>% 
+  dplyr::mutate(mother_univ_pw11_imputed = ifelse(mother_edu_pw11 == 6, 1, 0))
+
+sample_braincomp_alpha_covs <- sample_braincomp_alpha_covs %>% 
+  dplyr::mutate(mother_univ_pw11_imputed = ifelse(mother_edu_pw11 == 6, 1, 0))
+
+# mean or most frequent value imputation for 
+```
+
+## Brain Signatures --> Internalizing Regression Models
+### Transform the internalizing symptom outcome variable for linear regression
+Box-cox transformation in R: https://www.r-bloggers.com/2022/10/box-cox-transformation-in-r/ 
+```{r}
+# distribution of component scores
+gf_histogram(~brain.int.win.comp_scores$brain_int_win_comp1, bins=15) #normal enough
+gf_histogram(~brain.int.win.comp_scores$brain_int_win_comp2, bins=15) #a bit skewed
+gf_histogram(~metadata_comp$cbclintprobtot_y7) # skewed; do box-cox transformation 
+
+# make a nicer graph of score distribution 
+
+# box-cox transformation on intprob (add constant of 1 to all values to make it positive, required for box-cox)
+metadata_comp <- metadata_comp %>% dplyr::mutate(cbclintprobtot_y7_pos = cbclintprobtot_y7+1)
+# extract optimal lambda 
+boxcox(lm(metadata_comp$cbclintprobtot_y7_pos ~ 1),
+       lambda = seq(-2, 2, 1/10), 
+       plotit = TRUE,  
+       eps = 1/50,     
+       xlab = expression(lambda), 
+       ylab = "log-Likelihood",   
+       ) #95% CI is roughly 0 to 0.5
+
+b <- boxcox(lm(metadata_comp$cbclintprobtot_y7_pos ~ 1),
+       lambda = seq(-2, 2, 1/10), 
+       plotit = TRUE,  
+       eps = 1/50,     
+       xlab = expression(lambda), 
+       ylab = "log-Likelihood",   
+       )
+
+lambda <- b$x[which.max(b$y)] # lambda = 0.26
+ 
+# apply the transformation 
+metadata_comp <- metadata_comp %>%
+  dplyr::mutate(
+    cbclintprobtot_y7_pos_boxcox = (cbclintprobtot_y7_pos ^ lambda- 1)/lambda 
+  )
+
+# add to dataset with more covariates
+sample_braincomp_alpha_covs_imputed <- sample_braincomp_alpha_covs_imputed %>% left_join(metadata_comp %>% dplyr::select(subID, cbclintprobtot_y7_pos_boxcox), by = "subID")
+
+braincomp_alpha_covs <- braincomp_alpha_covs %>% left_join(metadata_comp %>% dplyr::select(subID, cbclintprobtot_y7_pos_boxcox), by = "subID")
+
+sample_braincomp_alpha_covs <- sample_braincomp_alpha_covs %>% left_join(metadata_comp %>% dplyr::select(subID, cbclintprobtot_y7_pos_boxcox), by = "subID")
+
+#graph transformed varaible
+gf_histogram(~metadata_comp$cbclintprobtot_y7_pos_boxcox) #looks somewhat better
+```
+
+### Added in reviews: Supplemental Figure with internalizing sx variable distributions
+Before and after transformation
+purple fill = '#7570b3'
+green '#1B9E77' 
+```{r}
+# nicer looking graph of original distribution
+int_raw_graph <- ggplot(metadata_comp, aes(cbclintprobtot_y7)) +
+  geom_histogram(binwidth=1, fill = '#7570b3') + 
+  labs(x = "Internalizing Symptoms \n (Raw Scores, Untransformed)", tag = "A") +
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=12), axis.text.y = element_text(color="black", size=12), axis.title = element_text(size=15)) 
+
+# transformed distribution
+int_transformed_graph <- ggplot(metadata_comp, aes(cbclintprobtot_y7_pos_boxcox)) +
+  geom_histogram(binwidth=0.5, fill = '#1B9E77') + 
+  labs(x = "Internalizing Symptoms \n (Raw Scores, Transformed)", tag = "B") +
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=12), axis.text.y = element_text(color="black", size=12), axis.title = element_text(size=15)) 
+
+# combined figure, save
+library(patchwork)
+int_raw_graph + int_transformed_graph
+
+ggsave("figures/FigureS2_int_transform.png", dpi = 1000, height = 5, width = 8)
+
+fig_S2a <- metadata_comp %>% dplyr::select(cbclintprobtot_y7) %>% arrange(cbclintprobtot_y7) %>% drop_na()
+fig_S2b <- metadata_comp %>% dplyr::select(cbclintprobtot_y7_pos_boxcox) %>% arrange(cbclintprobtot_y7_pos_boxcox) %>% drop_na()
+
+write_csv(fig_S2a, "../../manuscripts/fran_jess_microbiome_brain/Nature Communications Submission/R2 Final Materials/Source Data Files/figS2a.csv")
+write_csv(fig_S2b, "../../manuscripts/fran_jess_microbiome_brain/Nature Communications Submission/R2 Final Materials/Source Data Files/figS2b.csv")
+```
+
+### Brain Signatures --> Internalizing Regression Models, controlling for selected covariates
+```{r}
+# regression with comp scores predicting internalizing, controlling for covariates
+comp1_int_trans_diet <- lm(cbclintprobtot_y7_pos_boxcox ~ brain_int_win_comp1 + sex_centered + BW_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + meanFD_centered, data=braincomp_alpha_covs)
+tab_model(comp1_int_trans_diet, robust=TRUE, show.std=TRUE, show.se=TRUE) # comp1 is positively related to internalizing
+
+comp2_int_trans <- lm(cbclintprobtot_y7_pos_boxcox ~ brain_int_win_comp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + meanFD_centered, data=braincomp_alpha_covs)
+tab_model(comp2_int_trans, robust=TRUE, show.std=TRUE, show.se=TRUE) # comp2 is positively related to internalizing
+```
+
+### Added in reviews: Brain Signatures --> Internalizing Regression Models, controlling for additional covariates
+sample_braincomp_alpha_covs_imputed
+maternalmh_zscore_composite_yr6
+mother_univ_pw11_imputed
+monthly_income_per_member
+```{r}
+# try standardizing and averaging within the sample
+sample_braincomp_alpha_covs <- sample_braincomp_alpha_covs %>% 
+  dplyr::mutate(
+    STAI_Z_wsamp_yr6 = (STAI_prorated_state_yr6 - mean(STAI_prorated_state_yr6,na.rm=T))/sd(STAI_prorated_state_yr6,na.rm=T),
+    BDI_Z_wsamp_yr6 = (BDI2_prorated_score_yr6 - mean(BDI2_prorated_score_yr6,na.rm=T)/sd(BDI2_prorated_score_yr6,na.rm=T))
+  )
+
+sample_braincomp_alpha_covs$maternalmh_zscore_wsamp_composite_yr6 = sample_braincomp_alpha_covs %>%
+  dplyr::select(., STAI_Z_wsamp_yr6,BDI_Z_wsamp_yr6) %>% 
+  rowMeans(na.rm=T)
+
+sample_braincomp_alpha_covs %>% dplyr::count(mother_univ_pw11)# 62% less than university, 5 missing
+sample_braincomp_alpha_covs %>% dplyr::count(mother_edu_pw11) 
+sample_braincomp_alpha_covs %>% dplyr::count(!is.na(monthly_income_per_member)) # 4 missing
+
+# regression with comp scores predicting internalizing, controlling for covariates
+comp1_int_add_covs <- lm(cbclintprobtot_y7_pos_boxcox ~ brain_int_win_comp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + `PUFA_%` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(comp1_int_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+comp2_int_add_covs <- lm(cbclintprobtot_y7_pos_boxcox ~ brain_int_win_comp2 + sex_centered + GA_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(comp2_int_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+cor.test(cbclintprobtot_y7_pos_boxcox~maternalmh_zscore_composite_yr6, data=sample_braincomp_alpha_covs) 
+cor.test(brain_int_win_comp2~maternalmh_zscore_composite_yr6, data=sample_braincomp_alpha_covs) 
+cor.test(brain_int_win_comp1~maternalmh_zscore_composite_yr6, data=sample_braincomp_alpha_covs) 
+
+cor.test(brain_int_win_comp2~cbclintprobtot_y7_pos_boxcox, data=sample_braincomp_alpha_covs) 
+cor.test(brain_int_win_comp1~cbclintprobtot_y7_pos_boxcox, data=sample_braincomp_alpha_covs) 
+
+# correlations iwth self-reported symptoms 1 year later
+sample_braincomp_alpha_covs <- sample_braincomp_alpha_covs %>% left_join(dep_self, by = "subID") %>% 
+  left_join(anx_self, by = "subID") %>% 
+  dplyr::select(-contains("usability") & -contains(".y")) 
+
+sample_braincomp_alpha_covs <- sample_braincomp_alpha_covs %>% 
+  mutate(
+    cdi2_Z_yr8 = (cdi2_tot_y8 - mean(cdi2_tot_y8,na.rm=T))/sd(cdi2_tot_y8,na.rm=T),
+    masc2_Z_yr8 = (masc2_tot_y8 - mean(masc2_tot_y8,na.rm=T))/sd(masc2_tot_y8,na.rm=T),
+  )
+
+sample_braincomp_alpha_covs$self_int_Zscore_y8 = sample_braincomp_alpha_covs %>%
+  dplyr::select(., cdi2_Z_yr8,masc2_Z_yr8) %>% 
+  rowMeans(na.rm=T)
+
+sample_braincomp_alpha_covs$self_int_sum_y8 = sample_braincomp_alpha_covs %>%
+  dplyr::select(., cdi2_tot_y8,masc2_tot_y8) %>% 
+  rowSums()
+```
+
+### Added in reviews: caregiver-reported internalizing symptom associations with maternal mental health and child self-reported symptoms
+```{r}
+# child self reported mh
+cor.test(cbclintprobtot_y7~masc2_tot_y8, data=sample_braincomp_alpha_covs) 
+cor.test(cbclintprobtot_y7~cdi2_tot_y8, data=sample_braincomp_alpha_covs) 
+
+# maternal mh composite
+cor.test(cbclintprobtot_y7~maternalmh_zscore_wsamp_composite_yr6, data=sample_braincomp_alpha_covs)
+```
+
+### Added in Reviews: Brain Signatures --> Other MH domains, controlling for covariates
+```{r}
+ggplot(aes(cbclextprobtot_y7), data=sample_braincomp_alpha_covs) +
+  geom_histogram()
+
+# add somatic complaints
+som_com <- read_csv("../../data/child_beh/GUSTO_CBCL_scores_Y07_20220516.csv") %>% 
+  dplyr::select(subID = subjid, cbclsomcomtot_y7)
+
+sample_braincomp_alpha_covs <- sample_braincomp_alpha_covs %>% left_join(som_com, by = "subID")
+
+# externalizing problems 
+
+# without covariates
+comp1_ext <- lm(cbclextprobtot_y7 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+tab_model(comp1_ext, robust=TRUE, show.std=TRUE, show.se=TRUE) # B = 0.39, SE = 0.12, p = .003
+cor.test(cbclextprobtot_y7 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+comp2_ext <- lm(cbclextprobtot_y7 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+tab_model(comp2_ext, robust=TRUE, show.std=TRUE, show.se=TRUE) # B = 0.29, SE = 0.17, p = .096
+cor.test(cbclextprobtot_y7 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+
+# with covariates
+comp1_ext_add_covs <- lm(cbclextprobtot_y7 ~ brain_int_win_comp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + `PUFA_%` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs) 
+tab_model(comp1_ext_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+comp2_ext_add_covs <- lm(cbclextprobtot_y7 ~ brain_int_win_comp2 + sex_centered + BW_centered + GA_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(comp2_ext_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# depressive problems
+# without covariates
+comp1_dep <- lm(cbcldepprobtot_y7 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+tab_model(comp1_dep, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbcldepprobtot_y7 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+comp2_dep <- lm(cbcldepprobtot_y7 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+tab_model(comp2_dep, robust=TRUE, show.std=TRUE, show.se=TRUE)
+cor.test(cbcldepprobtot_y7 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+
+# with covariates
+comp1_dep_add_covs <- lm(cbcldepprobtot_y7 ~ brain_int_win_comp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + `PUFA_%` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(comp1_dep_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+comp2_dep_add_covs <- lm(cbcldepprobtot_y7 ~ brain_int_win_comp2 + sex_centered + BW_centered + GA_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(comp2_dep_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# anxiety problems
+# without covariates
+comp1_anx <- lm(cbclanxprobtot_y7 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+tab_model(comp1_anx, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbclanxprobtot_y7 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+comp2_anx <- lm(cbclanxprobtot_y7 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+tab_model(comp2_anx, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbclanxprobtot_y7 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+
+# with covariates
+comp1_anx_add_covs <- lm(cbclanxprobtot_y7 ~ brain_int_win_comp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + `PUFA_%` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(comp1_anx_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+comp2_anx_add_covs <- lm(cbclanxprobtot_y7 ~ brain_int_win_comp2 + sex_centered + GA_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(comp2_anx_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# somatic complaints
+comp1_somcom <- lm(cbclsomcomtot_y7 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+tab_model(comp1_somcom, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+comp2_somcom <- lm(cbclintprobtot_y7 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+tab_model(comp2_somcom, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# child self reported anxiety
+# without covariates (N=33)
+comp1_sranx <- lm(masc2_tot_y8 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+tab_model(comp1_sranx, robust=TRUE, show.std=TRUE, show.se=TRUE) #
+cor.test(masc2_tot_y8 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+comp2_sranx <- lm(masc2_tot_y8 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+tab_model(comp2_sranx, robust=TRUE, show.std=TRUE, show.se=TRUE)
+cor.test(masc2_tot_y8 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+
+# with covariates
+
+# child self reporte depressive sx
+# without covariates (N=32)
+comp1_srdep <- lm(cdi2_tot_y8 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+tab_model(comp1_srdep, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cdi2_tot_y8 ~ brain_int_win_comp1, data=sample_braincomp_alpha_covs)
+comp2_srdep <- lm(cdi2_tot_y8 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+tab_model(comp2_srdep, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cdi2_tot_y8 ~ brain_int_win_comp2, data=sample_braincomp_alpha_covs)
+
+# with covariates
+comp1_srdep_add_covs <- lm(cdi2_tot_y8 ~ brain_int_win_comp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + `PUFA_%` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(comp1_srdep_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+comp2_srdep_add_covs <- lm(cdi2_tot_y8 ~ brain_int_win_comp2 + sex_centered + GA_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(comp2_srdep_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+```
+Component 1 associated with externalizing, anxiety, depressive problems without covariates
+Component 2 associated with no others without covariates
+Neither components' associations survived inclusion of covariates
+Both components are associated with child self-reported depressive, but not anxiety, symptoms 1 year later
+
+## Identification of Microbiome Asosciations with Brain Signatures
+Microbiome Profiles and Alpha Diversity
+
+### Alpha Diversity
+Alpha diversity + covs ~ brain comps
+```{r}
+# shannon
+shannon_comp1 <- lm(brain_int_win_comp1 ~ shannon_entropy + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data = braincomp_alpha_covs)
+#assumptions for comp1 models (will look similar for other metrics bc alpha divs are all pretty normally distributed)
+shannon_comp1_resids <- resid(shannon_comp1)
+shannon_comp1_fitted <- fitted(shannon_comp1)
+##normality of residuals
+hist(shannon_comp1_resids) # relatively normal, a little bit sparse upper part of distributino
+##heteroskedasticity + linearity
+plot(shannon_comp1_resids ~ shannon_comp1_fitted) #
+
+tab_model(shannon_comp1, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns
+
+shannon_comp1_ncov <- lm(brain_int_win_comp1 ~ shannon_entropy, data = braincomp_alpha_covs)
+tab_model(shannon_comp1_ncov, robust=TRUE, show.std=TRUE) #ns
+
+shannon_comp2 <- lm(brain_int_win_comp2 ~ shannon_entropy + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data = braincomp_alpha_covs)
+
+#assumptions for comp2 models (will look similar for other metrics bc alpha divs are all pretty normally distributed)
+shannon_comp2_resids <- resid(shannon_comp2)
+shannon_comp2_fitted <- fitted(shannon_comp2)
+##normality of residuals
+hist(shannon_comp2_resids) # pretty normal
+##heteroskedasticity + linearity
+plot(shannon_comp2_resids ~ shannon_comp2_fitted) # 
+
+tab_model(shannon_comp2, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns
+shannon_comp1_ncov <- lm(brain_int_win_comp1 ~ shannon_entropy, data = braincomp_alpha_covs)
+tab_model(shannon_comp1_ncov, robust=TRUE, show.std=TRUE) #ns
+
+# observed features
+feat_comp1 <- lm(brain_int_win_comp1 ~ observed_features.x + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data = braincomp_alpha_covs)
+tab_model(feat_comp1, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns
+feat_comp1_ncovs <- lm(brain_int_win_comp1 ~ observed_features.x, data = braincomp_alpha_covs)
+tab_model(feat_comp1_ncovs, robust=TRUE, show.std=TRUE) #ns
+
+feat_comp2 <- lm(brain_int_win_comp2 ~ observed_features.x + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data = braincomp_alpha_covs)
+tab_model(feat_comp2, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns
+feat_comp2_ncovs <- lm(brain_int_win_comp2 ~ observed_features.x, data = braincomp_alpha_covs)
+tab_model(feat_comp2_ncovs, robust=TRUE, show.std=TRUE) #ns
+
+# faith pd
+faith_comp1 <- lm(brain_int_win_comp1 ~ faith_pd + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data = braincomp_alpha_covs)
+tab_model(faith_comp1, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns
+faith_comp1_ncovs <- lm(brain_int_win_comp1 ~ faith_pd, data = braincomp_alpha_covs)
+tab_model(faith_comp1_ncovs, robust=TRUE, show.std=TRUE) #ns
+
+faith_comp2 <- lm(brain_int_win_comp2 ~ faith_pd + sex_centered + GA_centered + BW_centered + deliv_mode +`Fat_%energy` + `PUFA_%`+ Fibre.per.1000kcal + meanFD_centered, data = braincomp_alpha_covs)
+tab_model(faith_comp2, robust=TRUE, show.std=TRUE, show.se=TRUE) #sig, higher faith with higher comp2 scores (beta = .38, p=.004)
+faith_comp2_ncovs <- lm(brain_int_win_comp2 ~ faith_pd, data = braincomp_alpha_covs)
+tab_model(faith_comp2_ncovs, robust=TRUE, show.se=TRUE, show.std=TRUE) #sig, same as with covariates
+
+# evenness
+even_comp1 <- lm(brain_int_win_comp1 ~ pielou_evenness + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data = braincomp_alpha_covs)
+tab_model(even_comp1, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns
+even_comp1_ncovs <- lm(brain_int_win_comp1 ~ pielou_evenness, data = braincomp_alpha_covs)
+tab_model(even_comp1_ncovs, robust=TRUE, show.std=TRUE) #ns
+
+even_comp2 <- lm(brain_int_win_comp2 ~ pielou_evenness + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data = braincomp_alpha_covs)
+tab_model(even_comp2, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns
+even_comp2_ncovs <- lm(brain_int_win_comp2 ~ pielou_evenness, data = braincomp_alpha_covs)
+tab_model(even_comp2_ncovs, robust=TRUE, show.std=TRUE) #ns
+
+# quick scatterplot of faith and brain comp2
+ggplot(braincomp_alpha_covs, aes(faith_pd, brain_int_win_comp2)) +
+  geom_jitter() +
+  geom_smooth(method="lm")
+
+#note: did not remove or winsorize high outliers on Faith bc if you look in the full sample, it appears Faith has bimodal distribution (there is a smaller high group which is just very small in this subsample) 
+```
+
+### Added in review: Alpha Diversity with additional covariates
+```{r}
+shannon_comp1 <- lm(brain_int_win_comp1 ~ shannon_entropy + sex_centered + GA_centered + BW_centered + deliv_mode + `PUFA_%` +`Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(shannon_comp1, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns p = .60
+
+shannon_comp2 <- lm(brain_int_win_comp2 ~ shannon_entropy + sex_centered + GA_centered + BW_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(shannon_comp2, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns p = .21
+
+# observed features
+feat_comp1 <- lm(brain_int_win_comp1 ~ observed_features + sex_centered + GA_centered + BW_centered + deliv_mode + `PUFA_%` +`Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(feat_comp1, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns p = .94
+
+feat_comp2 <- lm(brain_int_win_comp2 ~ observed_features + sex_centered + GA_centered + BW_centered + deliv_mode + `PUFA_%` +`Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(feat_comp2, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns, p = .45
+
+# faith pd
+faith_comp1 <- lm(brain_int_win_comp1 ~ faith_pd + sex_centered + GA_centered + BW_centered + deliv_mode +`PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(faith_comp1, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns, p = .64
+
+partial_r2(faith_comp1)
+
+faith_comp2 <- lm(brain_int_win_comp2 ~ faith_pd + sex_centered + GA_centered + BW_centered + deliv_mode +`PUFA_%` +`Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(faith_comp2, robust=TRUE, show.std=TRUE, show.se=TRUE) # B = 0.37, SE = 0.12, p = .006
+
+
+partial_r2(faith_comp2)
+
+faith_comp2_ninco <- lm(brain_int_win_comp2 ~ faith_pd + sex_centered + GA_centered + BW_centered + deliv_mode +`PUFA_%` +`Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data=sample_braincomp_alpha_covs)
+tab_model(faith_comp2_ninco, robust=TRUE, show.std=TRUE, show.se=TRUE) # B = .34, SE = .12, p = .008
+
+faith_comp2_ncovs <- lm(brain_int_win_comp2 ~ faith_pd, data=sample_braincomp_alpha_covs)
+tab_model(faith_comp2_ncovs, robust=TRUE, show.std=TRUE, show.se=TRUE) # B = .33, SE = .13, p = .013
+
+# evenness
+even_comp1 <- lm(brain_int_win_comp1 ~ pielou_evenness + sex_centered + GA_centered + BW_centered + deliv_mode +`PUFA_%`+  `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=sample_braincomp_alpha_covs)
+tab_model(even_comp1, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns p = .55
+
+even_comp2 <- lm(brain_int_win_comp2 ~ pielou_evenness + sex_centered + GA_centered + BW_centered + deliv_mode +`PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data = sample_braincomp_alpha_covs)
+tab_model(even_comp2, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns p = .29
+
+# multiple comparison correction: 2 sets of 4 tests (comp1: faith, even, shannon, features; comp2: faith, even, shannon, features)
+p.adjust(c(.006, .22, .29, .45), method = "BH")
+```
+
+
+### Figure 4: Faith's PD and SOFA Inter-Network Signature
+We will residualize both x and y to represent a partial regression coefficient, which is what we get from a MLR controlling for covariates. 
+```{r}
+braincomp_faith <- braincomp_alpha_covs %>% 
+  filter(!is.na(sex_centered) & !is.na(GA_centered) &!is.na(BW_centered) &!is.na(deliv_mode) & !is.na(`Fat_%energy`) & !is.na(Fibre.per.1000kcal) & !is.na(meanFD_centered) & !is.na(cbclintprobtot_y7) & !is.na(faith_pd))
+
+# residualize brain comp2 scores by covariates
+braincomp2_resid <- lm(brain_int_win_comp2 ~sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data = braincomp_faith)
+
+# resiaulize faith by covariates
+faith_resid <- lm(faith_pd ~sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered, data = braincomp_faith)
+
+braincomp_faith <- braincomp_faith %>% 
+  mutate(
+    braincomp2_resid = resid(braincomp2_resid),
+    faith_braincomp2_resid = resid(faith_resid)
+  ) 
+
+# graph
+ggplot(braincomp_faith, aes(faith_braincomp2_resid, braincomp2_resid)) +
+  geom_point(position=position_jitter(w=0.3, h=0)) +
+  geom_smooth(method="lm", fill = '#7570b3', color = '#7570b3') +
+  ylab("SOFA Between Network \n Connectivity Brain Signature") + xlab("Faith's Phylogenetic Diversity") +
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=12), axis.text.y = element_text(color="black", size=12), axis.title = element_text(size=15)) 
+
+# save
+ggsave("figures/Figure4.jpg", width = 9, height=5, dpi=1000)
+```
+
+### Added in Review: Revised Figure 4
+```{r}
+braincomp_faith <- all_data_add %>% 
+  filter(!is.na(sex_centered) & !is.na(GA_centered) &!is.na(BW_centered) &!is.na(deliv_mode) & !is.na(`Fat_%energy`) & !is.na(Fibre.per.1000kcal) & !is.na(meanFD_centered) & !is.na(cbclintprobtot_y7) & !is.na(faith_pd) & !is.na(mother_univ_pw11))
+
+# residualize brain comp2 scores by covariates
+braincomp2_resid <- lm(brain_int_win_comp2 ~sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data = braincomp_faith)
+
+# resiaulize faith by covariates
+faith_resid <- lm(faith_pd ~sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data = braincomp_faith)
+
+braincomp_faith <- braincomp_faith %>% 
+  mutate(
+    braincomp2_resid = resid(braincomp2_resid),
+    faith_braincomp2_resid = resid(faith_resid)
+  ) 
+
+# graph
+ggplot(braincomp_faith, aes(faith_braincomp2_resid, braincomp2_resid)) +
+  geom_smooth(method="lm", fill = '#7570b3', color = '#7570b3', linewidth = 1) +
+  geom_point(position=position_jitter(w=0.3, h=0), size = 1) +
+  ylab("SOFA Between Network \n Connectivity Brain Signature") + xlab("Faith's Phylogenetic Diversity") +
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=6), axis.text.y = element_text(color="black", size=6), axis.title = element_text(size=7)) 
+
+# save as .jpg for draft
+ggsave("figures/Figure4_R1.jpg", width = 9, height=5, dpi=1000)
+
+# save as .pdf, with smaller labels and resized, for final submission
+ggsave("figures/Figure4_final_resized.pdf", width = 88, height=60, units = "mm", dpi=1000)
+
+# save values to put in source data files
+fig4 <- braincomp_faith %>% dplyr::select(braincomp2_resid, faith_braincomp2_resid)
+
+write_csv(fig4, "../../manuscripts/fran_jess_microbiome_brain/Nature Communications Submission/R2 Final Materials/Source Data Files/fig4.csv")
+```
+
+### Microbial Profile(s) with SOFA, MTL, SAL Intra-Network Signature
+```{r}
+# grab mb ids with values for the brain-int compoment scores
+mb_data_brainint <- brain.int.win.comp_scores %>% dplyr::select(subID) %>% left_join(mb_data, by = "subID") #%>% dplyr::select(-subID)
+rownames(mb_data_brainint) <- mb_data_brainint$subID
+mb_data_brainint <- mb_data_brainint %>% dplyr::select(-subID)
+
+# initial sPLS model (should specify a large number of components first)
+tune.spls1.braincomp.mb <- pls(X=mb_data_brainint, Y=brain.int.win.comp_scores$brain_int_win_comp1, ncomp=4, mode='regression')
+
+# evaluate number of variables to select from X matrix (using number of components selected above)
+list.keepX <- c(5:10, seq(15, 93, 5)) # specify selection up to the number of features in the dataset (93)
+
+# evaluate tuning w/ R^2
+set.seed(main.seed)
+tune.spls1.braincomp.mb.R2 <- mixOmics::tune.spls(mb_data_brainint, brain.int.win.comp_scores$brain_int_win_comp1, ncomp= 2, 
+                            test.keepX = list.keepX, 
+                            validation = 'Mfold', 
+                            folds = 10,
+                            nrepeat = 100, 
+                            progressBar = TRUE,
+                            measure = 'R2') 
+
+plot(tune.spls1.braincomp.mb.R2) #highest R^2 (0.02) is with 1 component and 5 features
+
+#how many components to keep w this?
+choice.ncomp <- tune.spls1.braincomp.mb.R2$choice.ncomp$ncomp #1
+# how many x variables with 1 component? 5
+choice.keepX <- tune.spls1.braincomp.mb.R2$choice.keepX[1:1] #5
+
+# specify final model with 1 components, 5 features on comp1
+spls1.braincomp.mb <- spls(X=mb_data_brainint, Y=brain.int.win.comp_scores$brain_int_win_comp1, ncomp = choice.ncomp, keepX = choice.keepX, mode = "regression")
+
+# extract list of features that were selected (each component is orthogonal)
+selectVar(spls1.braincomp.mb, comp = 1)$X$name #selected "Eubacterium" "hallii" "Coprococcus" "Dialister"   "Weissella"  
+plotLoadings(spls1.braincomp.mb, 'X') # positive is Eubacterium, blautia; negative is hallii, coproccocus, and dialister
+
+plot(spls1.braincomp.mb$variates$X, spls1.braincomp.mb$variates$Y,
+     xlab = 'X component', ylab = 'y component / scaled y') #
+
+cor(spls1.braincomp.mb$variates$X, spls1.braincomp.mb$variates$Y) # cor = .43
+
+# extract component scores to investigate low outlier (010-04087)
+mbXbraincomp_comp1 <- as.data.frame(spls1.braincomp.mb$variates$X) %>% 
+  dplyr::rename(mb_braincomp_comp1 = comp1) %>% rownames_to_column(var = "subID")
+
+mb_data_brainint %>% 
+  rownames_to_column(var = "subID") %>% 
+  pivot_longer(-subID) %>% #To make the data in long form required for `tidyverse`
+  group_by(name) %>% #Based on which column you want aggregate 
+  identify_outliers(value) %>% 
+  select(name, subID, value, is.outlier, is.extreme) %>% # extreme = Q3 + 3*IQR, outlier = Q3 + 1.5*IQR
+  dplyr::filter(name %in% c("Eubacterium", "hallii", "Coprococcus", "Dialister", "Weissella")) %>% 
+  dplyr::filter(subID=="010-04087") # this sub is extreme high outlier on coprococcus, hallii, weissella, and high outlier on dialister
+```
+
+### Winsorize low microbiome outlier
+```{r}
+# initialize a new dataset
+mb_data_brainint_win <- mb_data_brainint %>% rownames_to_column(var = "subID")
+
+# get the second highest coproccocus value to replace the outlier with (based on visual inspection, second highest value is ok)
+top_2_coproccocus_values <- mb_data_brainint %>% 
+  arrange(desc(Coprococcus)) %>% 
+  slice_head(n=2) %>% 
+  dplyr::select(Coprococcus)
+
+top_2_coproccocus_values$Coprococcus[2]
+
+# replace both outlier sub's Coprococcus value with the second highest
+mb_data_brainint_win$Coprococcus[mb_data_brainint_win$subID=="010-04087"] <- top_2_coproccocus_values$Coprococcus[2]
+
+# same procedure but for hallii
+top_2_hallii_values <- mb_data_brainint %>% 
+  arrange(desc(hallii)) %>% 
+  slice_head(n=2) %>% 
+  dplyr::select(hallii)
+
+top_2_hallii_values$hallii[2]
+
+mb_data_brainint_win$hallii[mb_data_brainint_win$subID=="010-04087"] <- top_2_hallii_values$hallii[2]
+
+# same procedure for weissella
+top_2_weissella_values <- mb_data_brainint %>% 
+  arrange(desc(Weissella)) %>% 
+   slice_head(n=2) %>% 
+  dplyr::select(Weissella)
+
+top_2_weissella_values$Weissella[2]
+
+mb_data_brainint_win$Weissella[mb_data_brainint_win$subID=="010-04087"] <- top_2_weissella_values$Weissella[2]
+
+
+# convert subID column to rowname for reading into spls
+ids <- mb_data_brainint_win %>% dplyr::select(subID)
+mb_data_brainint_win <- mb_data_brainint_win %>% dplyr::select(-subID) 
+rownames(mb_data_brainint_win) <- ids$subID
+```
+
+### Added in reviews: Further outlier investigation
+```{r}
+all_data_sample_cont %>% 
+  pivot_longer(-subID) %>% #To make the data in long form required for `tidyverse`
+  group_by(name) %>% #Based on which column you want to aggregate 
+  identify_outliers(value) %>% 
+  select(name, subID, value, is.outlier, is.extreme) %>% # extreme = Q3 + 3*IQR, outlier = Q3 + 1.5*IQR
+  dplyr::filter(subID=="010-04087")
+
+mean(all_data_sample_cont$observed_features) # mean is 81, so this is a high outlier on observed features
+
+# mother education
+all_data_sample$mother_edu_pw11[all_data_sample$subID == "010-04087"] # 6
+
+# bf
+all_data_sample$any_bf_months[all_data_sample$subID == "010-04087"] # >12M
+```
+
+### Microbial Profiles(s) with SOFA, MTL, SAL Intra-Network Signature, low outlier winsorized
+```{r}
+# initial sPLS model (should specify a large number of components first)
+tune.spls1.braincomp.mbwin <- pls(X=mb_data_brainint_win, Y=brain.int.win.comp_scores$brain_int_win_comp1, ncomp=4, mode='regression')
+
+# evaluate number of variables to select from X matrix (using number of components selected above)
+list.keepX <- c(5:10, seq(15, 93, 5)) # specify selection up to the number of features in the dataset (93)
+
+# evaluate tuning w/ R^2
+set.seed(main.seed)
+tune.spls1.braincomp.mbwin.R2 <- mixOmics::tune.spls(mb_data_brainint_win, brain.int.win.comp_scores$brain_int_win_comp1, ncomp= 2, 
+                            test.keepX = list.keepX, 
+                            validation = 'Mfold', 
+                            folds = 10,
+                            nrepeat = 100, 
+                            progressBar = TRUE,
+                            measure = 'R2') 
+
+plot(tune.spls1.braincomp.mb.R2) #highest R^2 (0.02) is with 1 component and 5 features
+
+#how many components to keep w this?
+choice.ncomp <- tune.spls1.braincomp.mbwin.R2$choice.ncomp$ncomp #1
+# how many x variables with 1 component? 5
+choice.keepX <- tune.spls1.braincomp.mbwin.R2$choice.keepX[1:1] #5
+
+# specify final model with 1 components, 5 features on comp1
+spls1.braincomp.mbwin <- spls(X=mb_data_brainint_win, Y=brain.int.win.comp_scores$brain_int_win_comp1, ncomp = 1, keepX = choice.keepX, 
+                    mode = "regression")
+
+# extract list of features that were selected (each component is orthogonal)
+selectVar(spls1.braincomp.mbwin, comp = 1)$X$name #selected "Eubacteriaceae" "Anaerobutyricum hallii" "Weissella" "Dialister"   "coproccocus"  
+plotLoadings(spls1.braincomp.mbwin, 'X') # positive is Eubacteriaceae; negative is Anaerobutyricum hallii, coproccocus, weissella, and dialister
+
+selectVar(spls1.braincomp.mbwin, comp = 1)$X$value
+
+plot(spls1.braincomp.mbwin$variates$X, spls1.braincomp.mbwin$variates$Y,
+     xlab = 'X component', ylab = 'y component / scaled y') #
+
+cor(spls1.braincomp.mbwin$variates$X, spls1.braincomp.mbwin$variates$Y) # cor = .51
+spls1.braincomp.mbwin$prop_expl_var$X
+
+# determine the variable importance (loading magnitude weighted by variance explained?)
+vip.spls1.braincomp.mbwin <- vip(spls1.braincomp.mbwin)
+vip.spls1.braincomp.mbwin[selectVar(spls1.braincomp.mbwin, comp=1)$X$name, 1] # 3 variables with VIP above 1 in comp 1
+
+# extract scores for mb component associated with brain comp2
+braincomp1.mbwin <- as.data.frame(spls1.braincomp.mbwin$variates$X) %>% 
+  dplyr::rename(mb_braincomp1 = comp1) %>% 
+  rownames_to_column(var="subID")
+
+# correlation p-value
+cor.test(braincomp1.mbwin$mb_braincomp1, brain.int.win.comp_scores$brain_int_win_comp1)
+```
+
+### Added in Reviews: Determine the Stability of Each Selected Feature, Microbial Profile 1
+```{r}
+set.seed(main.seed)
+perf.spls1.braincomp.mbwin <- perf(spls1.braincomp.mbwin, validation = "Mfold", folds = 10, nrepeats = 100)
+
+# extract stability values
+stab.spls1.braincomp.mbwin <- perf.spls1.braincomp.mbwin$features$stability.X$comp1
+extr.stab.spls1.braincomp.mbwin <- as.data.frame(stab.spls1.braincomp.mbwin[selectVar(spls1.braincomp.mbwin, comp=1)$X$name]) %>% rownames_to_column(var="bacterium")
+colnames(extr.stab.spls1.braincomp.mbwin) <- c("bacterium", "stability")
+
+# average stability in comp 1
+sum(extr.stab.spls1.braincomp.mbwin$stability) / nrow(extr.stab.spls1.braincomp.mbwin) # 0.78
+```
+
+### Graph Microbe Loadings for SOFA, MTL, SAL Intra-Network Signature
+```{r}
+# extract feature loadings
+braincomp1_mb <- selectVar(spls1.braincomp.mbwin, comp = 1)$X$value %>% rownames_to_column(var = "genus")
+colnames(braincomp1_mb)[2] <- "loading_C1"
+
+# rename hallii to updated name (Anaerobutyricum hallii)
+braincomp1_mb$genus[braincomp1_mb$genus == "hallii"] <- "Anaerobutyricum" 
+
+# create a factor that sorts the loadings by magnitude 
+braincomp1_mb$genus <- factor(braincomp1_mb$genus, levels = braincomp1_mb$genus[order(braincomp1_mb$loading_C1, decreasing = TRUE)])
+
+# graph the 3 highest loadings (those with VIP >1 )by magnitude
+mb_pattern1 <- ggplot(braincomp1_mb %>% slice_max(., n=3, order_by=abs(loading_C1)), aes(x = reorder(genus, loading_C1), y = loading_C1)) +
+  geom_col(fill = '#95cacb') + 
+  coord_flip() +
+  ylab("Loading") + xlab("Genus") +
+  labs(tag = "B") +
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=6), axis.text.y = element_text(color="black", size=6), axis.title = element_text(size=7), plot.margin = margin(10, 10, 10, 10), plot.tag=element_text(size=7)) +
+  ggtitle("Microbial \n Profile 1") +
+  theme(plot.title = element_text(hjust=0.5, size=7, face='bold'))
+
+# extract loadings used in graph for source data file
+fig_1b <- braincomp1_mb %>% slice_max(., n=3, order_by=abs(loading_C1)) %>% arrange(desc(loading_C1))
+write_csv(fig_1b, "../../manuscripts/fran_jess_microbiome_brain/Nature Communications Submission/R2 Final Materials/Source Data Files/fig1b.csv")
+```
+
+### Microbial Profile(s) with SOFA Inter-Network Signature
+```{r}
+# initial sPLS model (should specify a large number of components first)
+tune.spls1.braincomp2.mb <- pls(X=mb_data_brainint, Y=brain.int.win.comp_scores$brain_int_win_comp2, ncomp=4, mode='regression')
+
+# evaluate number of variables to select from X matrix (using number of components selected above)
+list.keepX <- c(5:10, seq(15, 93, 5)) # specify selection up to the number of features in the dataset (93)
+
+# evaluate tuning w/ R^2
+set.seed(main.seed)
+tune.spls1.braincomp2.mbwin.R2 <- mixOmics::tune.spls(mb_data_brainint_win, brain.int.win.comp_scores$brain_int_win_comp2, ncomp= 2, 
+                            test.keepX = list.keepX, 
+                            validation = 'Mfold', 
+                            folds = 10,
+                            nrepeat = 100, 
+                            progressBar = TRUE,
+                            measure = 'R2') 
+
+plot(tune.spls1.braincomp2.mbwin.R2) #highest R^2 (0.02) is with 2 components with 5 and 20 features
+
+#how many components to keep w this?
+choice.ncomp <- tune.spls1.braincomp2.mbwin.R2$choice.ncomp$ncomp #1
+# how many x variables with 1 component? 5
+choice.keepX <- tune.spls1.braincomp2.mbwin.R2$choice.keepX[1:2] #5 features
+
+# specify final model with 2 components (best for model parsimony)
+spls1.braincomp2.mb <- spls(X=mb_data_brainint, Y=brain.int.win.comp_scores$brain_int_win_comp2, ncomp = 2, keepX = choice.keepX, mode = "regression")
+
+# extract list of features that were selected (each component is orthogonal)
+selectVar(spls1.braincomp2.mb, comp = 1)$X$name #selected "coprostanoligenes" "Terrisporobacter"  "Enterococcus"      "Lactobacillus"     "Dialister"   
+selectVar(spls1.braincomp2.mb, comp = 1)$X$value
+plotLoadings(spls1.braincomp2.mb, 'X', comp=1) # positive is coprostanoligenes, Terrisporobacter, dialister; negative is enteroccocus, lactobacillus
+
+# get the variable names and loading values
+selectVar(spls1.braincomp2.mb, comp = 2)$X$name
+mb_pattern3_loadings <- selectVar(spls1.braincomp2.mb, comp = 2)$X$value %>% rownames_to_column(var = "bacterium")
+colnames(mb_pattern3_loadings) <- c("bacterium", "loading")
+plotLoadings(spls1.braincomp2.mb, 'X', comp=2) 
+
+# determine the variable importance (loading magnitude weighted by variance explained?)
+vip.spls1.braincomp2.mb <- vip(spls1.braincomp2.mb)
+vip.spls1.braincomp2.mb[selectVar(spls1.braincomp2.mb, comp=1)$X$name, 1] # 2 variables with VIP above 1 in comp 1
+test <- as.data.frame(vip.spls1.braincomp2.mb[selectVar(spls1.braincomp2.mb, comp=2)$X$name, 2]) %>% rownames_to_column(var= "bacterium") # 10 variables with VIP above 1 in comp 1
+colnames(test) <- c("bacterium", "VIP")
+
+# merge loadings with vip
+mb_pattern3_loadings <- mb_pattern3_loadings %>% left_join(test, by = "bacterium") %>% dplyr::mutate(loading = signif(loading, 2), VIP = signif(VIP, 2))
+
+# write the output (changed this bc we will merge the stability scores with loadings and vip below before outputting)
+#write_csv(mb_pattern3_loadings, "tables/TableS3.csv")
+
+plot(spls1.braincomp2.mb$variates$X, spls1.braincomp2.mb$variates$Y,
+     xlab = 'X component', ylab = 'y component / scaled y') #looks like a nicer scatterplot than for comp1
+
+cor(spls1.braincomp2.mb$variates$X, spls1.braincomp2.mb$variates$Y) # cor = .60
+
+spls1.braincomp2.mb$prop_expl_var$X
+
+# extract scores for mb component associated with brain comp2
+braincomp2.mbwin <- as.data.frame(spls1.braincomp2.mb$variates$X) %>% 
+  dplyr::rename(mb1_braincomp2 = comp1,
+                mb2_braincomp2 = comp2) %>% 
+  rownames_to_column(var="subID")
+
+# correlation p-values
+cor.test(braincomp2.mbwin$mb1_braincomp2, brain.int.win.comp_scores$brain_int_win_comp2)
+cor.test(braincomp2.mbwin$mb2_braincomp2, brain.int.win.comp_scores$brain_int_win_comp2)
+```
+
+### Added in Reviews: Determine the Stability of Each Feature, Microbial Profiles 2 and 3
+```{r}
+set.seed(main.seed)
+perf.spls1.braincomp2.mb <- perf(spls1.braincomp2.mb, validation = "Mfold", folds = 10, nrepeats = 100)
+
+# extract stability values
+stab.spls1.braincomp2.mb1 <- perf.spls1.braincomp2.mb$features$stability.X$comp1
+extr.stab.spls1.braincomp2.mb1 <- as.data.frame(stab.spls1.braincomp2.mb1[selectVar(spls1.braincomp2.mb, comp=1)$X$name]) %>% rownames_to_column(var="bacterium")
+colnames(extr.stab.spls1.braincomp2.mb1) <- c("bacterium", "stability")
+
+# average stability in microbiome profile 2
+sum(extr.stab.spls1.braincomp2.mb1$stability) / nrow(extr.stab.spls1.braincomp2.mb1) # 0.64
+
+stab.spls1.braincomp2.mb2 <- perf.spls1.braincomp2.mb$features$stability.X$comp2
+extr.stab.spls1.braincomp2.mb2 <- as.data.frame(stab.spls1.braincomp2.mb2[selectVar(spls1.braincomp2.mb, comp=2)$X$name]) %>% rownames_to_column(var="bacterium")
+colnames(extr.stab.spls1.braincomp2.mb2) = c("bacterium", "stability")
+
+# average stability in comp 2
+sum(extr.stab.spls1.braincomp2.mb2$stability) / nrow(extr.stab.spls1.braincomp2.mb2) # 0.82
+
+# add stability values into df with loadings and vips for profile 3
+mb_pattern3_loadings_stab <- mb_pattern3_loadings %>% left_join(extr.stab.spls1.braincomp2.mb2, by = "bacterium")
+
+write_csv(mb_pattern3_loadings_stab, "tables/TableS3_R1.csv")
+```
+
+### Graph Microbe Loadings for SOFA Inter-Network Signature, and Visualize all Microbial Profiles Together
+```{r}
+# extract feature loadings
+braincomp2_mb1 <- selectVar(spls1.braincomp2.mb, comp = 1)$X$value %>% rownames_to_column(var = "genus")
+colnames(braincomp2_mb1)[2] <- "loading_C1"
+braincomp2_mb2 <- selectVar(spls1.braincomp2.mb, comp = 2)$X$value %>% rownames_to_column(var = "genus")
+colnames(braincomp2_mb2)[2] <- "loading_C2"
+
+# create a factor that sorts the loadings by magnitude 
+braincomp2_mb1$genus <- factor(braincomp2_mb1$genus, levels = braincomp2_mb1$genus[order(braincomp2_mb1$loading_C1, decreasing = TRUE)])
+
+braincomp2_mb2$genus <- factor(braincomp2_mb2$genus, levels = braincomp2_mb2$genus[order(braincomp2_mb2$loading_C2, decreasing = TRUE)])
+
+# graph loadings for second microbial profile by magnitude (2 loadings have VIP > 1)
+mb_pattern2 <- ggplot(braincomp2_mb1 %>% slice_max(., n=2, order_by=abs(loading_C1)), aes(x = reorder(genus, loading_C1), y = loading_C1)) +
+  geom_col(fill = '#fd988d') + 
+  coord_flip() +
+  ylab("Loading") + xlab("Genus") +
+  labs(tag = "D") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=6), axis.text.y = element_text(color="black", size=6), axis.title = element_text(size=7), plot.margin = margin(10, 10, 10, 10), plot.tag=element_text(size=7)) + 
+  ggtitle("Microbial \n Profile 2") +
+  theme(plot.title = element_text(hjust=0.5, size=7, face='bold'))
+
+#ggsave('../../../../Users/Fran/conferences/bridget_australia/mbcomp1_brain2.jpg', width = 9, height=7, dpi=1000)
+
+# graph 10 highest loadings by magnitude for third microbial profile (10 vars have VIP > 1)
+mb_pattern3 <- 
+  ggplot(braincomp2_mb2 %>% slice_max(., n=10, order_by=abs(loading_C2)), aes(x = reorder(genus, loading_C2), y = loading_C2)) +
+  geom_col(fill = '#fd988d') + 
+  coord_flip() +
+  ylab("Loading") + xlab("Genus") +
+  labs(tag = "E") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=6), axis.text.y = element_text(color="black", size=6), axis.title = element_text(size=7), plot.margin = margin(10, 10, 10, 10), plot.tag=element_text(size=7)) +
+  ggtitle("Microbial \n Profile 3") +
+  theme(plot.title = element_text(hjust=0.5, size=7, face='bold'))
+
+# save all 3 of the microbiome patterns together
+library(patchwork)
+mb_pattern1 + mb_pattern2 + mb_pattern3
+
+#ggsave('figures/Figure2.png', mb_pattern1 + mb_pattern2 + mb_pattern3, width = 12, height=5, dpi=1000)
+
+# extract loadings for use in source files
+fig_1d <- braincomp2_mb1 %>% slice_max(., n=2, order_by=abs(loading_C1)) %>% arrange(desc(loading_C1))
+fig_1e <- braincomp2_mb2 %>% slice_max(., n=10, order_by=abs(loading_C2)) %>% arrange(desc(loading_C2))
+
+write_csv(fig_1d, "../../manuscripts/fran_jess_microbiome_brain/Nature Communications Submission/R2 Final Materials/Source Data Files/fig1d.csv")
+write_csv(fig_1e, "../../manuscripts/fran_jess_microbiome_brain/Nature Communications Submission/R2 Final Materials/Source Data Files/fig1e.csv")
+```
+
+### Added in review: N not zero for each genus in the Microbial Profiles, and average abundance in sample
+Eubacterium, hallii, weissella, coprococcus, dialister, coprostanoligenes, Terrisporobacter, Terrisporobacter, Enterococcus, 
+```{r}
+# original mb dataset without clr transformaiton on abundance, in analytic sample
+genera_sample <- otus %>%  dplyr::filter(grepl("-24M", `#SampleID`)) %>% dplyr::mutate(
+  subID = sub("-24M$", "", `#SampleID`)) %>% dplyr::select(subID, everything())
+
+raw_genera_sample <-all_data_sample %>% dplyr::select(subID) %>% left_join(genera_sample, by = "subID")
+
+# shorten names so easier to grab
+# assign rownames (ids) to mb and brain data
+raw_genera_sample_noids <- raw_genera_sample %>% dplyr::select(-subID, -`#SampleID`)
+rownames(raw_genera_sample_noids) <- raw_genera_sample$subID
+
+#shorten mb names to be just genus (or family if genus not uniquely named) -- for plotting below
+split_mb_names <- str_split(colnames(raw_genera_sample_noids), "\\.")
+
+for (i in 1:length(colnames(raw_genera_sample_noids))){
+    if (grepl("UCG|Ruminiclostridium", split_mb_names[[i]][length(split_mb_names[[i]])-1])) { #if the phylum is UCG, then take genus and species 
+    colnames(raw_genera_sample_noids)[i] <- str_c(split_mb_names[[i]][length(split_mb_names[[i]])-1], split_mb_names[[i]][length(split_mb_names[[i]])], sep=".")
+    }
+  else if (grepl("__|[0-9]|uncultured|group", split_mb_names[[i]][length(split_mb_names[[i]])])) { #else if text after last dot (genus) is either a number or null or group...
+    colnames(raw_genera_sample_noids)[i] <- split_mb_names[[i]][length(split_mb_names[[i]])-1] #then take the phylum as the name
+    } 
+    else {
+    colnames(raw_genera_sample_noids)[i] <- split_mb_names[[i]][length(split_mb_names[[i]])] #if not, take the genus as the short name
+  }
+}
+test <- make.unique(colnames(raw_genera_sample_noids))
+colnames(raw_genera_sample_noids) <- test
+
+# n not zero for each
+ns_not_zero <- raw_genera_sample_noids %>% 
+  dplyr::select(
+    Eubacterium, hallii, Weissella, Coprococcus, Dialister, coprostanoligenes, Terrisporobacter, Lactobacillus, Enterococcus, Catenibacterium, Veillonella, Fusicatenibacter, Intestinibacter,Eisenbergiella,  Lachnoclostridium, Ruminiclostridium.5, Pseudobutyrivibrio, Ruminococcus, Subdoligranulum, Erysipelatoclostridium, UCG.014, Dialister, gauvreauii, Alistipes, NC2004, Akkermansia, Megasphaera, Bifidobacterium)
+
+ns_not_zero_results <- apply(ns_not_zero, 2, function(x) sum(x != 0))
+averages <- apply(ns_not_zero, 2, function(x) mean(x))
+
+# figure for average abundance -- don't think that's what they want
+
+# reshape df so that column name is variable, other variable is abundance
+genera_raw_reshaped <- ns_not_zero %>% 
+  pivot_longer(cols = everything(),
+               names_to = "genus",
+               values_to = "abundance")
+
+library(ggridges)
+ggplot(genera_raw_reshaped, aes(x = abundance, y = genus)) +
+  geom_density_ridges(scale = 3, rel_min_height = 0.01) +
+  xlim(0, 10000)
+
+# figure with average relative abundance of top 20 most abundance genera in sample (after filtering)
+ids_subID <- ids %>% mutate(subID = sub("-24M$", "", `#SampleID`)) %>% dplyr::select(subID, everything())
+data.filter$subID <- ids_subID$subID
+rel_ab_sample <- data.filter[!grepl("48M", data.filter$subID), ]
+
+# shorten names of filtered df
+rel_ab_sample_noids <- rel_ab_sample %>% dplyr::select(-subID)
+rownames(rel_ab_sample_noids) <- rel_ab_sample$subID
+split_mb_names <- str_split(colnames(rel_ab_sample_noids), "\\.")
+
+for (i in 1:length(colnames(rel_ab_sample_noids))){
+    if (grepl("UCG|Ruminiclostridium", split_mb_names[[i]][length(split_mb_names[[i]])-1])) { #if the phylum is UCG, then take genus and species 
+    colnames(rel_ab_sample_noids)[i] <- str_c(split_mb_names[[i]][length(split_mb_names[[i]])-1], split_mb_names[[i]][length(split_mb_names[[i]])], sep=".")
+    }
+  else if (grepl("__|[0-9]|uncultured|group", split_mb_names[[i]][length(split_mb_names[[i]])])) { #else if text after last dot (genus) is either a number or null or group...
+    colnames(rel_ab_sample_noids)[i] <- split_mb_names[[i]][length(split_mb_names[[i]])-1] #then take the phylum as the name
+    } 
+    else {
+    colnames(rel_ab_sample_noids)[i] <- split_mb_names[[i]][length(split_mb_names[[i]])] #if not, take the genus as the short name
+  }
+}
+
+rel_ab_sample_final <- rel_ab_sample_noids %>% rownames_to_column(var="subID")
+
+# filter to only include analytic sample
+analytic_sample_ids <- all_data_sample$subID
+
+rel_ab_sample_final_anlalytic <- rel_ab_sample_final %>% dplyr::filter(subID %in% analytic_sample_ids)
+
+# calculate relative abundance
+rel_ab_sample_calc <- rel_ab_sample_final_anlalytic %>% dplyr::select(-subID)
+rownames(rel_ab_sample_calc) <- rel_ab_sample_final_anlalytic$subID
+row_sums <- rowSums(rel_ab_sample_calc)
+relab_sample <- (rel_ab_sample_calc / row_sums)
+
+# check 
+row_sums_check <- rowSums(relab_sample)
+
+# calculate average relative abundance for each genus
+relab_average <- as.data.frame(colMeans(relab_sample))
+
+hist.data.frame(ns_not_zero, nclass=5)
+
+genera_long <- ns_not_zero %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Plot histograms
+ggplot(genera_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  theme_bw() +
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(x = "Count") +
+  labs(title = "Histogram of Counts for All Genera Selected in sPLS")
+
+ggsave("figures/genera_abundance_test.pdf", dpi=1000, height=12, width=12)
+
+# jen suggested adding relab_average for each genera to the graph somehow? 
+relab_sample_spls <- relab_sample %>%
+  dplyr::select(Eubacterium, hallii, Weissella, Coprococcus, Dialister, coprostanoligenes, Terrisporobacter, Lactobacillus, Enterococcus, Catenibacterium, Veillonella, Fusicatenibacter, Intestinibacter,Eisenbergiella,  Lachnoclostridium, Ruminiclostridium.5, Pseudobutyrivibrio, Ruminococcus, Subdoligranulum, Erysipelatoclostridium, UCG.014, Dialister, gauvreauii, Alistipes, NC2004, Akkermansia, Megasphaera, Bifidobacterium) 
+
+relab_long <- relab_sample_spls %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+mean_values <- relab_long %>%
+  dplyr::group_by(variable) %>%
+  dplyr::summarize(mean_value = mean(value, na.rm = TRUE))
+
+ggplot(relab_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol=4) +
+  geom_vline(data = mean_values, aes(xintercept=mean_value), color="red", linetype="dashed") + 
+  theme_bw() +
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(x = "Relative Abundance") #+
+  #labs(title = "Histogram of Relative Abundance for Each Genus Selected in sPLS")
+
+ggsave("figures/genera_relab.pdf", dpi=1000, height=12, width=12)
+ggsave("figures/genera_relab.png", dpi=1000, height=12, width=12)
+
+# output data to add to source data file
+fig_S3<- relab_sample_spls %>% dplyr::select(sort(names(.)))
+
+write_csv(fig_S3, "../../manuscripts/fran_jess_microbiome_brain/Nature Communications Submission/R2 Final Materials/Source Data Files/figS3.csv")
+```
+Relative abundance graph and calculation from: https://forum.qiime2.org/t/ggplot-relative-abundance-out-of-100/21382/3 
+
+## Microbial Profiles --> Brain Signatures Regression Models
+### Association of Microbial Profiles with Brain Signatures, controlling for covariates
+Covariates are PUFA, dietary fat, fiber, GA, BW, and sex
+```{r}
+# add mb component scores to larger dataset with all covs and brain comp scores
+all_data <- braincomp_alpha_covs %>% dplyr::left_join(braincomp1.mbwin, by = "subID") %>% left_join(braincomp2.mbwin, by = "subID") 
+all_data_sample <- sample_braincomp_alpha_covs %>% dplyr::left_join(braincomp1.mbwin, by = "subID") %>% left_join(braincomp2.mbwin, by = "subID")
+
+# comp1 mb, comp1 brain
+braincomp1_mb <- lm(brain_int_noamyg_win_comp1 ~ mb_braincomp1 + sex_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered, data = all_data)
+tab_model(braincomp1_mb, robust=TRUE, show.std=TRUE, show.se=TRUE) #positive, B=.40, p = .038
+braincomp1_mb_ncovs <- lm(brain_int_noamyg_win_comp1 ~ mb_braincomp1, data = all_data)
+tab_model(braincomp1_mb_ncovs, robust=TRUE, show.std=TRUE, show.se=TRUE) #positive, B=0.51, p = .001
+
+# comp1 mb, comp2 brain
+braincomp2_mb1 <- lm(brain_int_noamyg_win_comp2 ~ mb1_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered, data = all_data)
+tab_model(braincomp2_mb1, robust=TRUE, show.std=TRUE, show.se=TRUE) #positive, B=.55, p = .007
+braincomp2_mb_ncovs <- lm(brain_int_noamyg_win_comp2 ~ mb1_braincomp2, data = all_data)
+tab_model(braincomp2_mb_ncovs, robust=TRUE, show.std=TRUE) #positive, B=0.54, p < .001
+
+# comp2 mb, comp2 brain
+braincomp2_mb2 <- lm(brain_int_noamyg_win_comp2 ~ mb2_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + GA_centered, data = all_data)
+tab_model(braincomp2_mb2, robust=TRUE, show.std=TRUE, show.se=TRUE) #positive, B=.59, p = .012
+braincomp2_mb_ncovs <- lm(brain_int_noamyg_win_comp2 ~ mb2_braincomp2, data = all_data)
+tab_model(braincomp2_mb_ncovs, robust=TRUE, show.std=TRUE) #positive, B=0.55, p < .001
+```
+
+### Added in Reviews: Association of Microbial Profiles with Brain Signatures, controlling for additional covariates
+```{r}
+# add mb component scores to larger dataset with all covs and brain comp scores
+all_data_add <- sample_braincomp_alpha_covs %>% dplyr::left_join(braincomp1.mbwin, by = "subID") %>% left_join(braincomp2.mbwin, by = "subID") 
+
+# comp1 mb, comp1 brain
+braincomp1_mb_add <- lm(brain_int_win_comp1 ~ mb_braincomp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp1_mb_add, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# compute partial r squared in a paths
+partial_r2(braincomp1_mb_add)
+
+# comp1 mb, comp2 brain
+braincomp2_mb1_add <- lm(brain_int_win_comp2 ~ mb1_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp2_mb1_add, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+partial_r2(braincomp2_mb1_add)
+
+# comp2 mb, comp2 brain
+braincomp2_mb2_add <- lm(brain_int_win_comp2 ~ mb2_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + GA_centered + meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp2_mb2_add, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+partial_r2(braincomp2_mb2_add)
+```
+## Mediation Analysis
+
+### Association of Microbial Profiles with Internalizing Symptoms, controlling for covariates (Mediation Model Total Effects)
+```{r}
+# N=43 for the below with covs, N=55 for without covs
+
+# microbial profile 1
+braincomp1_comp1mb_int <- lm(cbclintprobtot_y7_pos_boxcox ~ mb_braincomp1 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered, data = all_data)
+tab_model(braincomp1_comp1mb_int, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns, B = .28, p = .14
+
+braincomp1_comp1mb_int_ncovs <- lm(cbclintprobtot_y7_pos_boxcox ~ mb_braincomp1, data = all_data)
+tab_model(braincomp1_comp1mb_int_ncovs, robust=TRUE, show.std=TRUE, show.se=TRUE) # significant, B = .32, p = .01
+
+# microbial profile 2
+braincomp2_comp1mb_int <- lm(cbclintprobtot_y7_pos_boxcox ~ mb1_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered, data = all_data)
+tab_model(braincomp2_comp1mb_int, robust=TRUE, show.std=TRUE, show.se=TRUE) # ns, B = .37, p = .06
+
+braincomp2_comp1mb_int_ncovs <- lm(cbclintprobtot_y7_pos_boxcox ~ mb1_braincomp2, data = all_data)
+tab_model(braincomp2_comp1mb_int_ncovs, robust=TRUE, show.std=TRUE) # ns, B = .22, p = .17
+
+# microbial profile 3
+braincomp2_comp2mb_int <- lm(cbclintprobtot_y7_pos_boxcox ~ mb2_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered, data = all_data)
+tab_model(braincomp2_comp2mb_int, robust=TRUE, show.std=TRUE, show.se=TRUE) # ns, B = .07, p = .78
+
+braincomp2_comp2mb_int_ncovs <- lm(cbclintprobtot_y7_pos_boxcox ~ mb2_braincomp2, data = all_data)
+tab_model(braincomp2_comp2mb_int_ncovs, robust=TRUE, show.std=TRUE) # ns, B = .21, p = .14
+
+# faith
+faith_internalizing <- lm(cbclintprobtot_y7_pos_boxcox ~ faith_pd + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered, data = all_data)
+tab_model(faith_internalizing, robust=TRUE, show.std=TRUE, show.se=TRUE)
+```
+
+### Adding in Review: Association of Microbial Profiles with Internalizing Symptoms, controlling for additional covariates (Mediation Model Total Effects)
+```{r}
+# microbial profile 1
+braincomp1_comp1mb_int <- lm(cbclintprobtot_y7_pos_boxcox ~ mb_braincomp1 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample)
+tab_model(braincomp1_comp1mb_int, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# compute partial r squared in the total effect
+partial_r2(braincomp1_comp1mb_int)
+
+# microbial profile 2
+braincomp2_comp1mb_int <- lm(cbclintprobtot_y7_pos_boxcox ~ mb1_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample)
+tab_model(braincomp2_comp1mb_int, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+partial_r2(braincomp2_comp1mb_int)
+
+# microbial profile 3
+braincomp2_comp2mb_int <- lm(cbclintprobtot_y7_pos_boxcox ~ mb2_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample)
+tab_model(braincomp2_comp2mb_int, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+partial_r2(braincomp2_comp2mb_int)
+
+# faith
+faith_internalizing <- lm(cbclintprobtot_y7_pos_boxcox ~ faith_pd + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample)
+tab_model(faith_internalizing, robust=TRUE, show.std=TRUE, show.se=TRUE)
+
+partial_r2(faith_internalizing)
+```
+
+### Mediation Models: Microbiome Features --> Brain Signatures --> Internalizing Symptoms 
+Before using process run entire process.R script from Andrew Hayes to load the process() function
+```{r}
+# **transformed var, process**
+process(data=all_data, y="cbclintprobtot_y7_pos_boxcox", x="mb_braincomp1", m=c("brain_int_win_comp1"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered"), model=4, seed=100770, stand=1) # significant a path, b path, n.s. positive direct and indirect effects (n.s. positive total effect given above)
+
+process(data=all_data, y="cbclintprobtot_y7_pos_boxcox", x="mb1_braincomp2", m=c("brain_int_win_comp2"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered"), model=4, seed=100770, stand=1) # significant a path, n.s. b path, n.s. positive direct and indirect effects (n.s. positive total effect)
+
+process(data=all_data, y="cbclintprobtot_y7_pos_boxcox", x="mb2_braincomp2", m=c("brain_int_win_comp2"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered"), model=4, seed=100770, stand=1) # significant a path and b path, significant positive indirect effect, n.s. negative direct effect (n.s. but positive total effect)
+
+
+# faith as the x-variable iwth each brain component
+process(data=all_data, y="cbclintprobtot_y7_pos_boxcox", x="faith_pd", m=c("brain_int_win_comp1"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered"), model=4, seed=100770, stand=1) # n.s. direct and indirect, n.s. a path
+
+process(data=all_data, y="cbclintprobtot_y7_pos_boxcox", x="faith_pd", m=c("brain_int_win_comp2"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered"), model=4, seed=100770, stand=1) # positive a path, b path, n.s. indirect and direct effects
+```
+
+### Added in Review: Mediation Models: Microbiome Features --> Brain Signatures --> Internalizing Symptoms, additional covariates
+```{r}
+sample_braincomp_alpha_covs <- sample_braincomp_alpha_covs %>% left_join()
+
+# **transformed var, process**
+process(data=all_data_sample, y="cbclintprobtot_y7_pos_boxcox", x="mb_braincomp1", m=c("brain_int_win_comp1"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered", "mother_univ_pw11"), model=4, seed=100770, stand=1) # significant a path, b path, n.s. positive direct and indirect effects (sig positive total effect given above)
+
+process(data=all_data_sample, y="cbclintprobtot_y7_pos_boxcox", x="mb1_braincomp2", m=c("brain_int_win_comp2"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered", "mother_univ_pw11"), model=4, seed=100770, stand=1) # significant a path, n.s. b path, n.s. positive direct and indirect effects (n.s. positive total effect)
+
+process(data=all_data_sample, y="cbclintprobtot_y7_pos_boxcox", x="mb2_braincomp2", m=c("brain_int_win_comp2"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered", "mother_univ_pw11"), model=4, seed=100770, stand=1) # significant a path and b path, significant positive indirect effect, n.s. negative direct effect (n.s. but positive total effect)
+
+# faith as the x-variable iwth each brain component
+process(data=all_data_sample, y="cbclintprobtot_y7_pos_boxcox", x="faith_pd", m=c("brain_int_win_comp1"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered", "mother_univ_pw11"), model=4, seed=100770, stand=1) # n.s. direct and indirect, n.s. a path
+
+process(data=all_data_sample, y="cbclintprobtot_y7_pos_boxcox", x="faith_pd", m=c("brain_int_win_comp2"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered", "mother_univ_pw11"), model=4, seed=100770, stand=1) # positive a path, b path, n.s. indirect and direct effects
+```
+
+### Added in review: specify mediation models in lavaan to get model fit statistics
+3 mediation models: 
+mb1 --> brain 1 --> int
+mb1 --> brain2 --> int
+mb2 --> brain2 --> int
+
+faith --> brain1 --> int
+faith --> brain2 --> int
+```{r}
+library(lavaan)
+
+model <- '
+  # outcome model: 
+  cbclintprobtot_y7_pos_boxcox ~ b*brain_int_win_comp2 + c_hat*mb2_braincomp2 + c1*sex_centered + c2*GA_centered + c3*BW_centered + c4*deliv_mode + c5*`Fat_%energy` + c6*Fibre.per.1000kcal + c7*`PUFA_%` + c8*meanFD_centered + c9*monthly_income_per_member
+  
+  # mediator model:
+  brain_int_win_comp2 ~ a*mb2_braincomp2 + + cm1*sex_centered + cm2*GA_centered + cm3*BW_centered + cm4*deliv_mode + cm5*`Fat_%energy` + cm6*Fibre.per.1000kcal + cm7*`PUFA_%` + cm8*meanFD_centered + cm9*monthly_income_per_member 
+  
+  indirect := a*b
+  direct := c_hat
+  total_c := c_hat + (a*b)'
+
+set.seed(100770)
+fit <- lavaan::sem(model, data = all_data_sample)
+summary(fit, standardized=T, fit.measures=T, rsquare=T)
+```
+
+### Added in reviews: calculate partial r squared for mediation model b paths
+```{r}
+# specify b path models, calc parital r squared
+braincomp1_comp1mb_bpath <- lm(cbclintprobtot_y7_pos_boxcox ~ mb_braincomp1 + brain_int_win_comp1 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample)
+
+partial_r2(braincomp1_comp1mb_bpath)
+
+braincomp2_comp1mb_bpath <- lm(cbclintprobtot_y7_pos_boxcox ~ mb1_braincomp2 + brain_int_win_comp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample)
+
+partial_r2(braincomp2_comp1mb_bpath)
+
+braincomp2_comp2mb_bpath <- lm(cbclintprobtot_y7_pos_boxcox ~ mb2_braincomp2 + brain_int_win_comp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample)
+
+partial_r2(braincomp2_comp2mb_bpath)
+
+braincomp1_faith_bpath <- lm(cbclintprobtot_y7_pos_boxcox ~ faith_pd + brain_int_win_comp1 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample)
+
+partial_r2(braincomp1_faith_bpath)
+
+braincomp2_faith_bpath <- lm(cbclintprobtot_y7_pos_boxcox ~ faith_pd + brain_int_win_comp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample)
+
+partial_r2(braincomp2_faith_bpath)
+
+```
+### Added in review: test Microbial Profile associations with other symptom domains
+```{r}
+# internalizing without covariates
+mb1_int <- lm(cbclintprobtot_y7_pos_boxcox ~ mb_braincomp1, data=all_data_sample)
+tab_model(mb1_int, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbclintprobtot_y7_pos_boxcox ~ mb_braincomp1, data=all_data_sample)
+mb2_int <- lm(cbclintprobtot_y7_pos_boxcox ~ mb1_braincomp2, data=all_data_sample)
+tab_model(mb2_int, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+mb3_int <- lm(cbclintprobtot_y7_pos_boxcox ~ mb2_braincomp2, data=all_data_sample)
+tab_model(mb3_int, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# externalizing problems 
+
+# without covariates
+mb1_ext <- lm(cbclextprobtot_y7 ~ mb_braincomp1, data=all_data_sample)
+tab_model(mb1_ext, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbclextprobtot_y7 ~ mb_braincomp1, data=all_data_sample)
+mb2_ext <- lm(cbclextprobtot_y7 ~ mb1_braincomp2, data=all_data_sample)
+tab_model(mb2_ext, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbclextprobtot_y7 ~ mb1_braincomp2, data=all_data_sample)
+mb3_ext <- lm(cbclextprobtot_y7 ~ mb2_braincomp2, data=all_data_sample)
+tab_model(mb3_ext, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbclextprobtot_y7 ~ mb2_braincomp2, data=all_data_sample)
+
+# with covariates
+mb1_ext_add_covs <- lm(cbclextprobtot_y7 ~ mb_braincomp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + `PUFA_%` + Fibre.per.1000kcal + meanFD_centered + monthly_income_per_member, data=all_data_sample) 
+tab_model(mb1_ext_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+mb2_ext_add_covs <- lm(cbclextprobtot_y7 ~ mb1_braincomp2 + sex_centered + BW_centered + GA_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + monthly_income_per_member, data=all_data_sample)
+tab_model(mb2_ext_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+mb3_ext_add_covs <- lm(cbclextprobtot_y7 ~ mb2_braincomp2 + sex_centered + BW_centered + GA_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + monthly_income_per_member, data=all_data_sample)
+tab_model(mb3_ext_add_covs, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# depressive problems
+# without covariates
+mb1_dep <- lm(cbcldepprobtot_y7 ~ mb_braincomp1, data=all_data_sample)
+tab_model(mb1_dep, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbcldepprobtot_y7 ~ mb_braincomp1, data=all_data_sample)
+mb2_dep <- lm(cbcldepprobtot_y7 ~ mb1_braincomp2, data=all_data_sample)
+tab_model(mb2_dep, robust=TRUE, show.std=TRUE, show.se=TRUE)
+cor.test(cbcldepprobtot_y7 ~ mb1_braincomp2, data=all_data_sample)
+
+mb3_dep <- lm(cbcldepprobtot_y7 ~ mb2_braincomp2, data=all_data_sample)
+tab_model(mb3_dep, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbcldepprobtot_y7 ~ mb2_braincomp2, data=all_data_sample)
+
+# with covariates -- not needed, n.s. without covariates
+
+# anxiety problems
+# without covariates
+mb1_anx <- lm(cbclanxprobtot_y7 ~ mb_braincomp1, data=all_data_sample)
+tab_model(mb1_anx, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbclanxprobtot_y7 ~ mb_braincomp1, data=all_data_sample)
+mb2_anx <- lm(cbclanxprobtot_y7 ~ mb1_braincomp2, data=all_data_sample)
+tab_model(mb2_anx, robust=TRUE, show.std=TRUE, show.se=TRUE)
+cor.test(cbclanxprobtot_y7 ~ mb1_braincomp2, data=all_data_sample)
+
+mb3_anx <- lm(cbclanxprobtot_y7 ~ mb2_braincomp2, data=all_data_sample)
+tab_model(mb3_anx, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cbclanxprobtot_y7 ~ mb2_braincomp2, data=all_data_sample)
+
+# with covariates -- not needed
+
+all_data_sample <- all_data_sample %>% left_join(sample_braincomp_alpha_covs %>% dplyr::select(subID, contains("y8")), by = "subID")
+
+# child self reported anxiety
+# without covariates (N=33)
+mb1_sranx <- lm(masc2_tot_y8 ~ mb_braincomp1, data=all_data_sample)
+tab_model(mb1_sranx, robust=TRUE, show.std=TRUE, show.se=TRUE)
+cor.test(masc2_tot_y8 ~ mb_braincomp1, data=all_data_sample)
+mb2_sranx <- lm(masc2_tot_y8 ~ mb1_braincomp2, data=all_data_sample)
+tab_model(mb2_sranx, robust=TRUE, show.std=TRUE, show.se=TRUE)
+cor.test(masc2_tot_y8 ~ mb1_braincomp2, data=all_data_sample)
+mb3_sranx <- lm(masc2_tot_y8 ~ mb2_braincomp2, data=all_data_sample)
+tab_model(mb3_sranx, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(masc2_tot_y8 ~ mb2_braincomp2, data=all_data_sample)
+
+# with covariates -- not needed
+
+# child self reported depressive sx
+# without covariates (N=32)
+mb1_srdep <- lm(cdi2_tot_y8 ~ mb_braincomp1, data=all_data_sample)
+tab_model(mb1_srdep, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cdi2_tot_y8 ~ mb_braincomp1, data=all_data_sample)
+mb2_srdep <- lm(cdi2_tot_y8 ~ mb1_braincomp2, data=all_data_sample)
+tab_model(mb2_srdep, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cdi2_tot_y8 ~ mb1_braincomp2, data=all_data_sample)
+mb3_srdep <- lm(cdi2_tot_y8 ~ mb2_braincomp2, data=all_data_sample)
+tab_model(mb3_srdep, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+cor.test(cdi2_tot_y8 ~ mb2_braincomp2, data=all_data_sample)
+
+# with covariates -- not needed
+```
+
+### Figure 1: Combined Brain Signatures and Microbial Patterns
+```{r}
+#combine the graphs generated in chunks above
+library(patchwork)
+plot_layout(brain_c1 + mb_pattern1 + plot_spacer() + brain_c2 + mb_pattern2 + mb_pattern3, nrow=2) 
+
+# save as .jpg for draft
+ggsave('figures/Figure1_combined_aligned_R1_test.jpg', width = 12, height=8, units="in", dpi=1000)
+
+# save as .pdf for final revision (so that it is in vector format)
+ggsave('figures/Figure1_combined_aligned_final.pdf', width = 180, height=125, units="mm", dpi=1000)
+```
+
+# Descriptives
+## Table 1: Descriptive Statistics
+```{r}
+#analysis_sample <- all_data %>% dplyr::filter(!is.na(cbclintprobtot_y7))
+
+# read in ethnicity
+eth <- read_xlsx("../../data/pregnancy_mh/STAI_BDI_FormA515_20201218.xlsx") %>% dplyr::select(subID = SubjectID, ethnicity = mother_ethnicity)
+
+# read in original sex, GA, meanFD, and BW measurements
+birth <- read_xlsx("../../data/general_covariates/GA_weight_Ages_at_measures_FormA515_20210719.xlsx") %>% dplyr::select(subID = SubjectID, GA, BW = c_weight_birth)
+
+sex <- read_xlsx("../../data/general_covariates/infant_sex.xlsx") %>% dplyr::select(subID = SubjectID, sex_binary) # 0 = female, 1 = male
+
+meanFD <- read_csv("../../data/general_covariates/meanFD.csv") %>% dplyr::filter(age==6)
+
+analysis_sample <- all_data %>% dplyr::filter(!is.na(cbclintprobtot_y7)) %>% dplyr::left_join(eth, by = "subID") %>% dplyr::left_join(birth, by = "subID") %>% dplyr::left_join(sex, by = "subID") %>% dplyr::left_join(meanFD, by = "subID")
+
+# means and sds 
+means_etc <- analysis_sample %>% dplyr::select(
+  subID, # numbers in var names below are for ordering
+  meanFD,
+  cbclintprobtot_y7, # changed in reviews, this was incorrectly set to t-scores
+  GA,
+  BW,
+  shannon_entropy,
+  observed_features.x,
+  pielou_evenness,
+  faith_pd,
+  `Protein_%energy`,
+  `Fat_%energy`,
+  `CHO_%energy`,
+  Fibre.per.1000kcal,
+  `SatFat_%`,
+  `MUFA_%`,
+  `PUFA_%`
+) %>% pivot_longer(
+  cols = !subID,
+  names_to = "variable",
+  values_to = "value"
+) %>% group_by(variable) %>% 
+  summarise(Mean = round(mean(value, na.rm=TRUE), digits=2), SD = round(sd(value, na.rm=TRUE), digits=2), Min = round(min(value, na.rm=TRUE), digits=2), Max = round(max(value, na.rm=TRUE),digits=2))
+
+colnames(means_etc) <- c("Measure", "Mean", "SD", "Min", "Max")
+
+write_csv(means_etc, "tables/Table1.csv")
+
+# ns and percentages (ethnicity, sex, birth method, age stopped breastfeeding, )
+analysis_sample %>% group_by(ethnicity) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>% arrange(desc(n))
+
+analysis_sample %>% group_by(sex_binary) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>% arrange(desc(n)) # 0=female
+
+analysis_sample %>% group_by(any_bf_months) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>% arrange(desc(n))
+
+analysis_sample %>% group_by(deliv_mode_str) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>% arrange(desc(n))
+
+# percent missing data check 
+analysis_sample %>% dplyr::count(is.na(Fibre.per.1000kcal))
+```
+
+## Added in reviews: additional Table 1 variables
+```{r}
+# percent of children scoring above clinical cutoff for internalizing sx (borderline: 60-63, clinical: 64 or higher)
+analysis_sample %>% dplyr::count(cbclintprobtscore_y7 > 59) # 3 borderline
+analysis_sample %>% dplyr::count(cbclintprobtscore_y7 > 63) # 6 clinical
+
+# same but for externalizing
+sample_braincomp_alpha_covs %>% dplyr::count(cbclextprobtscore_y7 > 59) # 3 borderline
+sample_braincomp_alpha_covs %>% dplyr::count(cbclextprobtscore_y7 > 63) # 3 clinical
+
+# monthly income per household member, maternal mh composite
+add_means <- sample_braincomp_alpha_covs %>% dplyr::select(
+  subID, # numbers in var names below are for ordering
+  monthly_income_per_member,
+  maternalmh_zscore_wsamp_composite_yr6,
+  cbclextprobtot_y7,
+  cbcldepprobtot_y7,
+  cbclanxprobtot_y7,
+  BDI2_prorated_score_yr6,
+  STAI_prorated_state_yr6
+) %>% pivot_longer(
+  cols = !subID,
+  names_to = "variable",
+  values_to = "value"
+) %>% group_by(variable) %>% 
+  summarise(Mean = round(mean(value, na.rm=TRUE), digits=2), SD = round(sd(value, na.rm=TRUE), digits=2), Min = round(min(value, na.rm=TRUE), digits=2), Max = round(max(value, na.rm=TRUE),digits=2))
+
+colnames(add_means) <- c("Measure", "Mean", "SD", "Min", "Max")
+
+write_csv(add_means, "tables/add_Table1.csv")
+
+# percent of families below singapore poverty level (650 per member)
+sample_braincomp_alpha_covs %>% dplyr::count(monthly_income_per_member < 650)
+
+# bdi, stai percent meeting clinical
+sample_braincomp_alpha_covs %>% group_by(BDI2_class_yr6) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+sample_braincomp_alpha_covs %>% group_by(STAI_clinical_yr6) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+# antibiotics, probiotics
+sample_braincomp_alpha_covs %>% group_by(antibio_M24) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+sample_braincomp_alpha_covs %>% group_by(probiotics_M24) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+# other medication use (duration is in days)
+meds_sample <- sample_braincomp_alpha_covs %>% 
+  dplyr::select(
+    subID,
+    contains("medications")
+  )
+
+# how many people took 1, 2, etc. medications
+meds_sample <- meds_sample %>% 
+  dplyr::mutate(
+    number_meds = case_when(
+      m24_medications == "0_no" ~ 0,
+      m24_medications == "1_yes" & !is.na(m24_medications_SN3_age) ~ 3,
+      m24_medications == "1_yes" & !is.na(m24_medications_SN2_age) & is.na(m24_medications_SN3_age) ~ 2,
+      m24_medications == "1_yes" & !is.na(m24_medications_SN1_age) & is.na(m24_medications_SN2_age) & is.na(m24_medications_SN3_age) ~ 1
+    )
+  )
+
+# there is 1 person with NA for number...
+na_number <- meds_sample[is.na(meds_sample$number_meds), "subID"] # that person only reported 1 med, so recode their value to 1
+meds_sample$number_meds[is.na(meds_sample$number_meds)] <- 1
+
+# how many people used no meds, 1 med, 2 meds, or 3+ meds
+meds_sample %>% group_by(number_meds) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+# mean, sd of duration of use
+duration_cols <- grep("duration", names(meds_sample), value=TRUE)
+all_durations <- unlist(meds_sample[, duration_cols])
+mean(all_durations, na.rm=TRUE) # 4.82
+sd(all_durations, na.rm=TRUE) # 4.00
+max(all_durations, na.rm=TRUE) # 45
+
+# maternal education
+sample_braincomp_alpha_covs %>% dplyr::count(mother_univ_pw11)
+sample_braincomp_alpha_covs %>% group_by(mother_edu_pw11) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+```
+
+
+## Cronbach's Alpha for CBCL Internalizing Symptom Items in This Sample
+```{r}
+# merge cbcl raw items with anlytic sample ids
+analysis_cbcl <- analysis_sample %>% dplyr::select(subID) %>% left_join(cbcl_raw_y7, by = "subID")
+
+# recode the raw responses into numeric 
+analysis_cbcl_clean <- analysis_cbcl %>% dplyr::mutate(
+  across(contains("cbcl"), ~case_when(
+    . == "Not True (as far as you know)" ~ 0,
+    . == "Somewhat or Sometimes True" ~ 1,
+    . == "Very True or Often True" ~ 2,
+    . == "-9999" ~ NA
+  ))
+)
+
+psych::alpha(analysis_cbcl_clean %>% dplyr::select(-subID)) # standardized alpha = 0.81
+```
+
+## Added in reviews: Alpha for other symptom measures in this sample
+```{r}
+# read in raw data
+anx_self_raw <- read_xlsx("../../Shiba/data/other ND data/GUSTO_Y08.5_MASC2_20220218.xlsx") %>% 
+  dplyr::select(
+    subID = subjid,
+    masc2_q1:masc2_q50
+  )
+
+dep_self_raw <- read_xlsx("../../Shiba/data/other ND data/GUSTO_Y08.5_CDI2_20210908.xlsx") %>% 
+  dplyr::select(
+    subID = subjid,
+    usability,
+    cdi2_q1s:cdi2_q28s
+  ) %>% 
+  dplyr::filter(usability == "usable") %>% 
+  dplyr::select(-usability)
+
+# externalizing, depressive, anxiety
+cbcl_raw_y7_add <- read_excel("../../data/child_beh/GUSTO_Y07_CBCL_20200330.xlsx", sheet = "Raw Data") %>%
+  dplyr::select(
+  subID = subjid,
+  # depressive items (5, 14, 18, 24, 35, 52, 54, 76, 77, 91, 100, 102, 103)
+  cbclq5_y7,
+  cbclq14_y7,
+  cbclq18_y7,
+  cbclq24_y7,
+  cbclq35_y7,
+  cbclq52_y7,
+  cbclq54_y7,
+  cbclq76_y7,
+  cbclq77_y7,
+  cbclq91_y7,
+  cbclq100_y7,
+  cbclq102_y7,
+  cbclq103_y7,
+  # anxiety items (11, 29, 30, 31, 45, 47, 50, 71, 112)
+  cbclq11_y7,
+  cbclq29_y7,
+  cbclq30_y7,
+  cbclq31_y7,
+  cbclq45_y7,
+  cbclq47_y7,
+  cbclq50_y7,
+  cbclq71_y7,
+  cbclq112_y7,
+  # externalizing items
+  # social problems (11, 12, 25, 27, 34, 36, 38, 48, 62, 64, 79)
+  cbclq11_y7,
+  cbclq12_y7,
+  cbclq25_y7,
+  cbclq27_y7,
+  cbclq34_y7,
+  cbclq36_y7,
+  cbclq38_y7,
+  cbclq48_y7,
+  cbclq62_y7,
+  cbclq64_y7,
+  cbclq79_y7,
+  # thought problems (9, 18, 40, 46, 58, 59, 60, 66, 70, 78, 83, 84, 85, 92, 100)
+  cbclq9_y7,
+  cbclq18_y7,
+  cbclq40_y7,
+  cbclq46_y7,
+  cbclq58_y7,
+  cbclq59_y7,
+  cbclq60_y7,
+  cbclq66_y7,
+  cbclq70_y7,
+  cbclq78_y7,
+  cbclq83_y7,
+  cbclq84_y7,
+  cbclq85_y7,
+  cbclq92_y7,
+  cbclq100_y7,
+  # attention problems (1, 4, 8, 10, 13, 17, 41, 61, 78, 80)
+  cbclq1_y7,
+  cbclq4_y7,
+  cbclq8_y7,
+  cbclq10_y7,
+  cbclq13_y7,
+  cbclq17_y7,
+  cbclq41_y7,
+  cbclq61_y7,
+  cbclq78_y7,
+  cbclq80_y7
+) %>% dplyr::mutate(
+  across(contains("cbcl"), ~case_when(
+    . == "Not True (as far as you know)" ~ 0,
+    . == "Somewhat or Sometimes True" ~ 1,
+    . == "Very True or Often True" ~ 2,
+    . == "-9999" ~ NA
+  ))
+)
+
+# get dataset with just sample 
+subs <- all_data_add %>% dplyr::select(subID)
+
+sr_dep <- subs %>% left_join(dep_self_raw, by = "subID")
+sr_anx <- subs %>% left_join(anx_self_raw, by = "subID")
+cg_ext <- subs %>% left_join(cbcl_raw_y7_add %>% dplyr::select(subID, cbclq11_y7,
+  cbclq12_y7,
+  cbclq25_y7,
+  cbclq27_y7,
+  cbclq34_y7,
+  cbclq36_y7,
+  cbclq38_y7,
+  cbclq48_y7,
+  cbclq62_y7,
+  cbclq64_y7,
+  cbclq79_y7,
+  # thought problems (9, 18, 40, 46, 58, 59, 60, 66, 70, 78, 83, 84, 85, 92, 100)
+  cbclq9_y7,
+  cbclq18_y7,
+  cbclq40_y7,
+  cbclq46_y7,
+  cbclq58_y7,
+  cbclq59_y7,
+  cbclq60_y7,
+  cbclq66_y7,
+  cbclq70_y7,
+  cbclq78_y7,
+  cbclq83_y7,
+  cbclq84_y7,
+  cbclq85_y7,
+  cbclq92_y7,
+  cbclq100_y7,
+  # attention problems (1, 4, 8, 10, 13, 17, 41, 61, 78, 80)
+  cbclq1_y7,
+  cbclq4_y7,
+  cbclq8_y7,
+  cbclq10_y7,
+  cbclq13_y7,
+  cbclq17_y7,
+  cbclq41_y7,
+  cbclq61_y7,
+  cbclq78_y7,
+  cbclq80_y7), by = "subID")
+
+cbcl_dep <- subs %>% left_join(cbcl_raw_y7_add %>% dplyr::select(subID, 
+                                                                 cbclq5_y7,
+  cbclq14_y7,
+  cbclq18_y7,
+  cbclq24_y7,
+  cbclq35_y7,
+  cbclq52_y7,
+  cbclq54_y7,
+  cbclq76_y7,
+  cbclq77_y7,
+  cbclq91_y7,
+  cbclq100_y7,
+  cbclq102_y7,
+  cbclq103_y7), by = "subID")
+
+cbcl_anx <- subs %>% left_join(cbcl_raw_y7_add %>% dplyr::select(subID,cbclq11_y7,
+  cbclq29_y7,
+  cbclq30_y7,
+  cbclq31_y7,
+  cbclq45_y7,
+  cbclq47_y7,
+  cbclq50_y7,
+  cbclq71_y7,
+  cbclq112_y7), by = "subID")
+
+# calc alpha
+psych::alpha(sr_dep %>% dplyr::select(-subID)) # 0.81
+psych::alpha(sr_anx %>% dplyr::select(-subID)) # 0.92
+psych::alpha(cg_ext %>% dplyr::select(-subID)) # 0.85
+psych::alpha(cbcl_dep %>% dplyr::select(-subID, -cbclq91_y7)) # 0.58 (acceptable)
+psych::alpha(cbcl_anx %>% dplyr::select(-subID)) # 0.62 (acceptable)
+# -cbclq30_y7, -cbclq47_y7
+```
+
+## Create Form B Dataset
+Including child internalizing, symptoms, covariates, microbiome diversity, microbial patterns, brain signatures
+```{r}
+# select only the variables in all_data that you use
+all_data_formb <- all_data %>% 
+  dplyr::select(
+    subID,
+    sex_centered,
+    GA_centered,
+    BW_centered,
+    meanFD_centered,
+    any_bf_months,
+    deliv_mode_str,
+    `Fat_%energy`,
+    Fibre.per.1000kcal,
+    `PUFA_%`,
+    `Protein_%energy`,
+    `CHO_%energy`,
+    `SatFat_%`,
+    `MUFA_%`,
+    cbclintprobtot_y7,
+    faith_pd,
+    observed_features = observed_features.x,
+    shannon_entropy,
+    pielou_evenness
+  )
+
+# add brain networks and microbes to the dataset
+all_data_formb <- all_data_formb %>% left_join(mb_cbcl, by = "subID") %>% left_join(brain_cbcl_win, by = "subID") %>% dplyr::select(
+  -contains("amyg")
+)
+
+write_csv(all_data_formb, "../../manuscripts/fran_jess_microbiome_brain/querdasi_mb-brain-int_formB (frq@ucla.edu)/querdasi_mb-brain-int_formB_data.csv")
+```
+
+# Added in Review: Analyses with Larger Sample Before Exclusion of Poor Quality Scans
+## Merge data for that sample
+```{r}
+# read in list of IDs
+mri_denom <- read_csv("mri_denominator.csv") %>% 
+  dplyr::filter(
+    mb==1 & cbcl7==1
+    ) %>% 
+  dplyr::select(
+    subID,
+    mb,
+    cbcl7,
+    included
+  )
+
+write_csv(mri_denom, "mri_denom_comparison_sample.csv")
+
+# read in all of the full sample dfs
+alpha_div_24m <- alpha_div %>% dplyr::filter(grepl("-24M", `#SampleID`)) %>% dplyr::mutate(
+  subID = sub("-24M$", "", `#SampleID`)) %>% dplyr::select(subID, everything())
+
+# read in genera, shorten names in full sample
+genera_filtered_clr <- data_clr_ids %>% dplyr::filter(grepl("-24M", `#SampleID`)) %>% dplyr::mutate(
+  subID = sub("-24M$", "", `#SampleID`)) %>% dplyr::select(subID, everything())
+
+# ethnicity, cbcl, masc, cdi, maternal mh, birth mode, age stopped breastfeeding, diet, income, education, antibiotics, probiotics, other meds
+# read in additional data
+# 0 = female, 1 = male
+
+birth_mode <- read_csv("../../data/mb_covariates/GUSTO_deliverymode_cleaned_20210623.csv") %>% rename(subID = subjid)
+
+bf <- read_csv("../../data/mb_covariates/GUSTO_breastfeeding_clean_20220803.csv") %>% rename(subID = subjid)
+
+# left join all of the stuff to that: demographics, symptoms, etc
+mri_denom_full <- mri_denom %>% left_join(sex, by = "subID") %>% left_join(birth, by = "subID") %>% left_join(edu, by = "subID") %>% left_join(eth, by = "subID") %>% left_join(income, by = "subID") %>% left_join(maternal_mh, by = "subID") %>% left_join(additional_cbcl, by = "subID") %>% left_join(biotics, by = "subID") %>% left_join(bf, by = "subID") %>% left_join(birth_mode, by = "subID") %>% left_join(meanFD, by = "subID") %>% left_join(diet, by = "subID") %>% left_join(cbcl_y7, by = "subID") %>% left_join(dep_self %>% dplyr::select(-usability), by = "subID") %>% left_join(anx_self %>% dplyr::select(-usability), by = "subID") %>% left_join(alpha_div_24m, by = "subID") %>% left_join(meds, by = "subID") %>% 
+  dplyr::mutate(
+    number_meds = case_when(
+      m24_medications == "0_no" ~ 0,
+      m24_medications == "1_yes" & !is.na(m24_medications_SN3_age) ~ 3,
+      m24_medications == "1_yes" & !is.na(m24_medications_SN2_age) & is.na(m24_medications_SN3_age) ~ 2,
+      m24_medications == "1_yes" & !is.na(m24_medications_SN1_age) & is.na(m24_medications_SN2_age) & is.na(m24_medications_SN3_age) ~ 1
+    )
+  )
+
+# there are 3 person with NA for number...
+na_number_fulln <- mri_denom_full[is.na(mri_denom_full$number_meds), "subID"] # that person only reported 1 med, so recode their value to 1
+
+# one the of these had  1, the others had 3+
+na_number_fulln <- na_number_fulln %>% left_join(mri_denom_full %>% dplyr::select(subID, contains("medications")), by = "subID")
+
+mri_denom_full$number_meds[mri_denom_full$subID == "010-20359"] <- 1
+mri_denom_full$number_meds[mri_denom_full$subID == "010-21565"] <- 3
+mri_denom_full$number_meds[mri_denom_full$subID == "010-22092"] <- 3
+
+# bind the genera
+mri_denom_full_final <- mri_denom_full %>% left_join(genera_filtered_clr %>% dplyr::select(-`#SampleID`), by = "subID")
+```
+
+## Table 1: Stats for Excluded participants
+```{r}
+# create a df with excluded participants
+mri_denom_full_final_excluded <- mri_denom_full_final %>% dplyr::filter(is.na(included))
+
+# collect all continuous varaibles, generate mean, sd, range
+means_excluded <- mri_denom_full_final_excluded %>% dplyr::select(
+  subID, # numbers in var names below are for ordering
+  meanFD,
+  cbclintprobtot_y7, # changed in reviews, this was incorrectly set to t-scores
+  GA,
+  BW,
+  shannon_entropy,
+  observed_features,
+  pielou_evenness,
+  faith_pd,
+  `Protein_%energy`,
+  `Fat_%energy`,
+  `CHO_%energy`,
+  Fibre.per.1000kcal,
+  `SatFat_%`,
+  `MUFA_%`,
+  `PUFA_%`,
+  monthly_income_per_member,
+  maternalmh_zscore_composite_yr6,
+  cbclextprobtot_y7,
+  cbcldepprobtot_y7,
+  cbclanxprobtot_y7,
+  BDI2_prorated_score_yr6,
+  STAI_prorated_state_yr6
+) %>% pivot_longer(
+  cols = !subID,
+  names_to = "variable",
+  values_to = "value"
+) %>% group_by(variable) %>% 
+  summarise(Mean = round(mean(value, na.rm=TRUE), digits=2), SD = round(sd(value, na.rm=TRUE), digits=2), Min = round(min(value, na.rm=TRUE), digits=2), Max = round(max(value, na.rm=TRUE),digits=2))
+
+colnames(means_excluded) <- c("Measure", "Mean", "SD", "Min", "Max")
+
+write_csv(means_excluded, "tables/Table1_excluded.csv")
+
+# ns and percentages for categorical variables (ethnicity, sex, birth method, age stopped breastfeeding, )
+mri_denom_full_final_excluded %>% group_by(ethnicity) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>% arrange(desc(n))
+
+mri_denom_full_final_excluded %>% group_by(sex_binary) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>% arrange(desc(n)) # 0=female
+
+mri_denom_full_final_excluded %>% group_by(any_bf_months) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>% arrange(desc(n))
+
+mri_denom_full_final_excluded %>% group_by(deliv_mode_str) %>% summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>% arrange(desc(n))
+
+# internalizing t-scores
+mri_denom_full_final_excluded %>% dplyr::count(cbclintprobtscore_y7 > 59) # 5 borderline
+mri_denom_full_final_excluded %>% dplyr::count(cbclintprobtscore_y7 > 63) # 7 clinical
+
+# externalizing t-scores
+mri_denom_full_final_excluded %>% dplyr::count(cbclextprobtscore_y7 > 59) # 6 borderline
+mri_denom_full_final_excluded %>% dplyr::count(cbclextprobtscore_y7 > 63) # 4 clinical
+
+# income below singapore poverty cutoff
+mri_denom_full_final_excluded %>% dplyr::count(monthly_income_per_member < 650)
+
+# maternal education
+mri_denom_full_final_excluded %>% dplyr::count(mother_univ_pw11)
+mri_denom_full_final_excluded %>% group_by(mother_edu_pw11) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+# maternal dep sx cutoffs
+mri_denom_full_final_excluded %>% group_by(BDI2_class_yr6) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+# maternal anx sx cutoffs 
+mri_denom_full_final_excluded %>% group_by(STAI_clinical_yr6) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+# antibiotics
+mri_denom_full_final_excluded %>% group_by(antibio_M24) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+# probiotics
+mri_denom_full_final_excluded %>% group_by(probiotics_M24) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+# number of meds
+mri_denom_full_final_excluded %>% group_by(number_meds) %>% summarise(n = n()) %>%
+  mutate(freq = round(n / sum(n), digits=2))
+
+# duration of meds
+duration_cols <- grep("duration", names(mri_denom_full_final_excluded), value=TRUE)
+all_durations <- unlist(mri_denom_full_final_excluded[, duration_cols])
+mean(all_durations, na.rm=TRUE) # 4.82
+sd(all_durations, na.rm=TRUE) # 4.00
+min(all_durations, na.rm=TRUE)
+max(all_durations, na.rm=TRUE) # 45
+
+```
+
+## Table 1: Differences for included vs excluded participants
+```{r}
+mri_denom_full_final <- mri_denom_full_final %>% dplyr::mutate(
+  included = ifelse(is.na(included), 0, included)
+)
+# chi square tests: ethnicity, child sex, birth method, age stopped breastfeeding, education, antibiotics, probiotics, number of meds 
+chisq.test(mri_denom_full_final$included, mri_denom_full_final$ethnicity) # ns
+chisq.test(mri_denom_full_final$included, mri_denom_full_final$sex_binary) # ns
+chisq.test(mri_denom_full_final$included, mri_denom_full_final$deliv_mode) # ns
+chisq.test(mri_denom_full_final$included, mri_denom_full_final$any_bf_months) # n s
+chisq.test(mri_denom_full_final$included, mri_denom_full_final$mother_edu_pw11) # ns
+chisq.test(mri_denom_full_final$included, mri_denom_full_final$antibio_M24) #ns
+chisq.test(mri_denom_full_final$included, mri_denom_full_final$probiotics_M24) #ns
+chisq.test(mri_denom_full_final$included, mri_denom_full_final$number_meds) #ns
+
+# t test: internalizing, externalizing, anxiety, depressive, alpha diversity, GA, BW, diet macronutrients, meanFD, income, maternal dep, maternal anx, duration of meds
+t.test(cbclintprobtot_y7~included, data=mri_denom_full_final) #ns
+t.test(cbcldepprobtot_y7~included, data=mri_denom_full_final) #ns
+t.test(cbclanxprobtot_y7~included, data=mri_denom_full_final) #ns
+t.test(cbclextprobtot_y7~included, data=mri_denom_full_final) #ns
+t.test(cbclextprobtot_y7~included, data=mri_denom_full_final) #ns
+t.test(shannon_entropy~included, data=mri_denom_full_final) #ns
+t.test(observed_features~included, data=mri_denom_full_final) #ns
+t.test(pielou_evenness~included, data=mri_denom_full_final) #ns
+t.test(faith_pd~included, data=mri_denom_full_final) #ns
+t.test(GA~included, data=mri_denom_full_final) #ns
+t.test(BW~included, data=mri_denom_full_final) #ns
+t.test(`Protein_%energy`~included, data=mri_denom_full_final)
+t.test(`Fat_%energy`~included, data=mri_denom_full_final)
+t.test(`CHO_%energy`~included, data=mri_denom_full_final)
+t.test(Fibre.per.1000kcal~included, data=mri_denom_full_final)
+t.test(`SatFat_%`~included, data=mri_denom_full_final)
+t.test(`MUFA_%`~included, data=mri_denom_full_final)
+t.test(`PUFA_%`~included, data=mri_denom_full_final)
+# all above are ns
+t.test(monthly_income_per_member~included, data=mri_denom_full_final) #ns
+t.test(meanFD~included, data=mri_denom_full_final) # sig (as expected)
+t.test(BDI2_prorated_score_yr6~included, data=mri_denom_full_final)
+t.test(STAI_prorated_state_yr6~included, data=mri_denom_full_final)
+```
+
+# Added in review: Generate microbiome profile scores in sample with CBCL and microbiome
+## Join all the data
+```{r}
+# shorten genera names in full sample (same code as used earlier in analytic sample)
+# assign rownames (ids) to mb data
+mb_data_short <- genera_filtered_clr %>% dplyr::select(-`#SampleID`)
+rownames(mb_data_short) <- mb_data_short$subID
+mb_data_short <- mb_data_short %>% dplyr::select(-subID)
+
+#shorten mb names to be just genus (or family if genus not uniquely named) -- for plotting below
+split_mb_names <- str_split(colnames(mb_data_short), "\\.")
+
+for (i in 1:length(colnames(mb_data_short))){
+    if (grepl("UCG|Ruminiclostridium", split_mb_names[[i]][length(split_mb_names[[i]])-1])) { #if the phylum is UCG, then take genus and species 
+    colnames(mb_data_short)[i] <- str_c(split_mb_names[[i]][length(split_mb_names[[i]])-1], split_mb_names[[i]][length(split_mb_names[[i]])], sep=".")
+    }
+  else if (grepl("__|[0-9]|uncultured|group", split_mb_names[[i]][length(split_mb_names[[i]])])) { #else if text after last dot (genus) is either a number or null or group...
+    colnames(mb_data_short)[i] <- split_mb_names[[i]][length(split_mb_names[[i]])-1] #then take the phylum as the name
+    } 
+    else {
+    colnames(mb_data_short)[i] <- split_mb_names[[i]][length(split_mb_names[[i]])] #if not, take the genus as the short name
+  }
+}
+
+mb_data_short <- mb_data_short %>% rownames_to_column(., var = "subID") %>% left_join(genera_filtered_clr %>% dplyr::select(subID, `#SampleID`), by = "subID")
+
+# N = 318 with both mb and cbcl
+mbcbcl_sample <- cbcl_y7 %>% full_join(mb_data_short, by = "subID") %>% full_join(alpha_div_24m, by = "subID") %>% 
+  dplyr::filter(!is.na(cbclintprobtot_y7) & !is.na(`#SampleID.x`) & !is.na(`#SampleID.y`)) %>% 
+  dplyr::select(
+    subID,
+    cbclintprobtot_y7,
+    shannon_entropy:faith_pd,
+    everything(),
+    -`#SampleID.x`,
+    -`#SampleID.y`
+  )
+
+# add covariates ()
+mbcbcl_sample <- mbcbcl_sample %>% left_join(sex, by = "subID") %>% left_join(birth, by = "subID") %>% left_join(edu, by = "subID") %>% left_join(eth, by = "subID") %>% left_join(income, by = "subID") %>% left_join(maternal_mh, by = "subID") %>% left_join(additional_cbcl, by = "subID") %>% left_join(biotics, by = "subID") %>% left_join(bf, by = "subID") %>% left_join(birth_mode, by = "subID") %>% left_join(meanFD, by = "subID") %>% left_join(diet, by = "subID") %>% left_join(dep_self %>% dplyr::select(-usability), by = "subID") %>% left_join(anx_self %>% dplyr::select(-usability), by = "subID")
+```
+
+## Calculate mb component scores
+```{r}
+# loading genus and values 
+braincomp1_mb
+braincomp2_mb1
+braincomp2_mb2
+
+# mb component 1
+matching_cols <- braincomp1_mb$genus[braincomp1_mb$genus %in% colnames(mbcbcl_sample)] # check
+loadings <- braincomp1_mb$loading[match(matching_cols, braincomp1_mb$genus)]
+
+rownames(mbcbcl_sample) <- mbcbcl_sample$subID
+
+# test with 010-04010
+eubacterium <- mbcbcl_sample$Eubacterium[mbcbcl_sample$subID == "010-04010"]
+hallii <- mbcbcl_sample$hallii[mbcbcl_sample$subID == "010-04010"]
+Weissella <- mbcbcl_sample$Weissella[mbcbcl_sample$subID == "010-04010"]
+Coprococcus <- mbcbcl_sample$Coprococcus[mbcbcl_sample$subID == "010-04010"]
+Dialister <- mbcbcl_sample$Dialister[mbcbcl_sample$subID == "010-04010"]
+
+test <- eubacterium*0.73666373 + hallii*-0.59221571 + Weissella*-0.30322574 + Coprococcus*-0.10868079 + Dialister*-0.05338298
+
+# maybe the genera values are getting scaled first? yes -- scaled to zero mean and 1 variance
+mbcbcl_sample_test <- mbcbcl_sample %>% 
+  dplyr::select(subID, Actinomyces:Akkermansia)
+rownames(mbcbcl_sample_test) <- mbcbcl_sample$subID
+
+mbcbcl_sample_test_scaled <- as.data.frame(scale(mbcbcl_sample_test, center = TRUE, scale = TRUE))
+mbcbcl_sample_test_scaled$subID <- mbcbcl_sample$subID
+
+weighted_data_scaled <- sweep(mbcbcl_sample_test_scaled[ , matching_cols, drop = FALSE], 2, loadings, `*`)
+mbcbcl_sample_test_scaled$mb1_score <- rowSums(weighted_data_scaled)
+
+mbcbcl_sample$mb1_score <- mbcbcl_sample_test_scaled$mb1_score
+
+# component 2
+matching_cols_2 <- braincomp2_mb1$genus[braincomp2_mb1$genus %in% colnames(mbcbcl_sample)] # check
+loadings_2 <- braincomp2_mb1$loading[match(matching_cols_2, braincomp2_mb1$genus)]
+
+weighted_data_scaled_2 <- sweep(mbcbcl_sample_test_scaled[ , matching_cols_2, drop = FALSE], 2, loadings_2, `*`)
+mbcbcl_sample$mb2_score <- rowSums(weighted_data_scaled_2)
+
+# comoponent 3
+matching_cols_3 <- braincomp2_mb2$genus[braincomp2_mb2$genus %in% colnames(mbcbcl_sample)] # check
+loadings_3 <- braincomp2_mb2$loading[match(matching_cols_3, braincomp2_mb2$genus)]
+
+weighted_data_scaled_3 <- sweep(mbcbcl_sample_test_scaled[ , matching_cols_3, drop = FALSE], 2, loadings_3, `*`)
+mbcbcl_sample$mb3_score <- rowSums(weighted_data_scaled_3)
+
+# new approach with predict() funciton 
+mb1_mbcbcl_sample <- predict(spls1.braincomp.mbwin, mbcbcl_sample_test)
+mb2_mbcbcl_sample <- predict(spls1.braincomp2.mb, mbcbcl_sample_test)
+
+# save component 1 scores into df
+mb1_mbclc_sample_comps <- as.data.frame(mb1_mbcbcl_sample$variates) %>% 
+  dplyr::rename(mb_braincomp1 = dim1) %>% 
+  rownames_to_column(var="subID")
+
+# save component 2 and 3 scores into a df
+mb23_mbcbcl_sample_comps <- as.data.frame(mb2_mbcbcl_sample$variates) %>% 
+  dplyr::rename(mb1_braincomp2 = dim1,
+                mb2_braincomp2 = dim2) %>% 
+  rownames_to_column(var="subID")
+
+# merge the mb component scores with rest of dataset
+mbcbcl_sample_final <- mbcbcl_sample %>% left_join(mb1_mbclc_sample_comps, by = "subID") %>% left_join(mb23_mbcbcl_sample_comps, by = "subID")
+```
+
+## Test associations of component scores with symptoms
+```{r}
+# transform cbcl, try again
+# box-cox transformation on intprob (add constant of 1 to all values to make it positive, required for box-cox)
+mbcbcl_sample_final <- mbcbcl_sample_final %>% dplyr::mutate(cbclintprobtot_y7_pos = cbclintprobtot_y7+1)
+# extract optimal lambda 
+boxcox(lm(mbcbcl_sample_final$cbclintprobtot_y7_pos ~ 1),
+       lambda = seq(-2, 2, 1/10), 
+       plotit = TRUE,  
+       eps = 1/50,     
+       xlab = expression(lambda), 
+       ylab = "log-Likelihood",   
+       ) #95% CI is roughly 0 to 0.5
+
+b <- boxcox(lm(mbcbcl_sample_final$cbclintprobtot_y7_pos ~ 1),
+       lambda = seq(-2, 2, 1/10), 
+       plotit = TRUE,  
+       eps = 1/50,     
+       xlab = expression(lambda), 
+       ylab = "log-Likelihood",   
+       )
+
+lambda_mbcbcl <- b$x[which.max(b$y)] # lambda = 0.14 for this sample
+ 
+# apply the transformation 
+mbcbcl_sample_final <- mbcbcl_sample_final %>%
+  dplyr::mutate(
+    cbclintprobtot_y7_pos_boxcox = (cbclintprobtot_y7_pos ^ lambda_mbcbcl- 1)/lambda_mbcbcl 
+  )
+
+# center sex, BW, GA, meanDF
+mbcbcl_sample_final <- mbcbcl_sample_final %>% 
+  mutate(GA_centered = GA - mean(GA, na.rm=T),
+         sex_centered = case_when(sex_binary == "0" ~ "-1",
+                                  sex_binary == "1" ~ "1",
+                                  TRUE ~ ""),
+         BW_centered = BW - mean(BW, na.rm=T),
+         meanFD_centered = meanFD - mean(meanFD, na.rm=T))
+
+# bivariate associations
+cor.test(cbclintprobtot_y7~mb_braincomp1, data = mbcbcl_sample_final) # 
+cor.test(cbclintprobtot_y7~mb1_braincomp2, data = mbcbcl_sample_final) # 
+cor.test(cbclintprobtot_y7~mb2_braincomp2, data = mbcbcl_sample_final) # 
+
+# with transformed variable
+cor.test(cbclintprobtot_y7_pos_boxcox~mb_braincomp1, data = mbcbcl_sample_final) # 
+cor.test(cbclintprobtot_y7_pos_boxcox~mb1_braincomp2, data = mbcbcl_sample_final) # 
+cor.test(cbclintprobtot_y7_pos_boxcox~mb2_braincomp2, data = mbcbcl_sample_final) # 
+
+# relationshiops controlling for covariates
+braincomp1_comp1mb_int_larger <- lm(cbclintprobtot_y7 ~ mb_braincomp1 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = mbcbcl_sample_final)
+tab_model(braincomp1_comp1mb_int_larger, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+braincomp2_comp1mb_int_larger <- lm(cbclintprobtot_y7 ~ mb1_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = mbcbcl_sample_final)
+tab_model(braincomp2_comp1mb_int_larger, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+braincomp2_comp2mb_int_larger <- lm(cbclintprobtot_y7 ~ mb2_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = mbcbcl_sample_final)
+tab_model(braincomp2_comp2mb_int_larger, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+```
+# Added in reviews: Sensitivity Analysis (regressions) removing participants who took antibiotics or probiotics
+Remove participants who took antibiotics or probiotics, re-run regressions
+Brain --> internalizing
+Brain --> microbiome
+Microbiome --> symptoms
+Mediation
+```{r}
+# create dataset without participants who took anti or probiotics
+all_data_sample_nobio <- all_data_sample %>% 
+  dplyr::filter(antibio_M24==0 & probiotics_M24==0) # 47/55 remained 
+
+# associations between brain signatures and internalizing symptoms, controlling for covariates
+comp1_int_nobio <- lm(cbclintprobtot_y7_pos_boxcox ~ brain_int_win_comp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + `PUFA_%` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=all_data_sample_nobio)
+tab_model(comp1_int_nobio, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+comp2_int_nobio <- lm(cbclintprobtot_y7_pos_boxcox ~ brain_int_win_comp2 + sex_centered + GA_centered + deliv_mode + `PUFA_%` + `Fat_%energy` + Fibre.per.1000kcal + meanFD_centered + mother_univ_pw11, data=all_data_sample_nobio)
+tab_model(comp2_int_nobio, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# associations between brain signatures and microbiome profiles, controlling for covariates
+# comp1 mb, comp1 brain
+braincomp1_mb_add_nobio <- lm(brain_int_win_comp1 ~ mb_braincomp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample_nobio)
+tab_model(braincomp1_mb_add_nobio, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# comp1 mb, comp2 brain
+braincomp2_mb1_add_nobio <- lm(brain_int_win_comp2 ~ mb1_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample_nobio)
+tab_model(braincomp2_mb1_add_nobio, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+# comp2 mb, comp2 brain
+braincomp2_mb2_add_nobio <- lm(brain_int_win_comp2 ~ mb2_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + GA_centered + meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp2_mb2_add_nobio, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# associations between microbial profiles and internalizing symptoms, controlling for covariates
+# microbial profile 1
+braincomp1_comp1mb_int_nobio <- lm(cbclintprobtot_y7_pos_boxcox ~ mb_braincomp1 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample_nobio)
+tab_model(braincomp1_comp1mb_int_nobio, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# microbial profile 2
+braincomp2_comp1mb_int_nobio <- lm(cbclintprobtot_y7_pos_boxcox ~ mb1_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample_nobio)
+tab_model(braincomp2_comp1mb_int_nobio, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+
+# microbial profile 3
+braincomp2_comp2mb_int_nobio <- lm(cbclintprobtot_y7_pos_boxcox ~ mb2_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_sample_nobio)
+tab_model(braincomp2_comp2mb_int_nobio, robust=TRUE, show.std=TRUE, show.se=TRUE) 
+```
+
+# Added in reviews: predicted metagenome from picrust
+merged_pathabundance_relab_unstratified is what we want
+## Picrust output preprocessing
+Picrust output needs to be converted to relative abundances: https://groups.google.com/g/picrust-users/c/kmhX2AMff8o 
+```{r}
+# read in the data
+picrust <- read_tsv("../../data/microbiome/M24_M48/picrust/picrust2_out_pipeline/pathways_out/path_abun_unstrat.tsv")
+
+# transpose
+picrust_t <- as.data.frame(t(picrust))
+colnames(picrust_t) <- picrust_t[1, ]
+picrust_t <- picrust_t[-1, ] 
+picrust_t_final <- picrust_t %>% 
+  mutate(across(everything(), as.numeric)) %>% 
+  rownames_to_column(var="#SampleID")
+
+# convert to relative abundance
+picrust_t_final$total_sum <- rowSums(picrust_t_final[ , -1])
+
+picrust_relab <-picrust_t_final %>% 
+  mutate(across(where(is.numeric), ~.x / total_sum)) %>% 
+  dplyr::select(-total_sum)
+
+# check -- this is 1 so we're good
+#picrust_relab$total_sum <- rowSums(picrust_relab[ , -1])
+
+# filter to only include analytic sample
+picrust_relab_test <- picrust_relab %>% 
+  dplyr::mutate(subID = str_remove(`#SampleID`, "-[0-9]+M$"),
+                Timepoint = str_extract(`#SampleID`, "-[0-9]+M$"))%>% 
+  dplyr::select(subID, `#SampleID`, Timepoint, everything())
+
+picrust_relab_24M <- picrust_relab_test %>% 
+  dplyr::filter(Timepoint == "-24M") %>% 
+  dplyr::select(-Timepoint)
+
+picrust_relab_sample <- all_data_sample %>% 
+  dplyr::select(subID) %>% 
+  dplyr::left_join(picrust_relab_24M, by = "subID")
+
+# remove rare pathways (zero abundance in more than 70%? of samples) -- keeps 346 out of 504 total pathways
+picrust_n_not_zero <- picrust_relab_sample %>% 
+  dplyr::summarize(across(where(is.numeric), ~sum(. !=0))) 
+
+picrust_relab_sample_filtered <- picrust_relab_sample %>% 
+  select(where(~ is.numeric(.) && mean(. == 0, na.rm = TRUE) <= 0.3))
+
+# alternative approach: filter the raw picrust data to only be in the sample, then pre-filter and clr norm
+picrust_raw <- picrust_t_final %>% 
+  dplyr::select(-total_sum) %>% 
+  dplyr::mutate(subID = str_remove(`#SampleID`, "-[0-9]+M$"),
+                Timepoint = str_extract(`#SampleID`, "-[0-9]+M$"))%>% 
+  dplyr::select(subID, `#SampleID`, Timepoint, everything())
+
+picrust_raw_filtered <- picrust_raw %>% 
+  dplyr::filter(Timepoint == "-24M") %>% 
+  dplyr::select(-Timepoint)
+
+picrust_raw_sample <- all_data_sample %>% 
+  dplyr::select(subID) %>% 
+  dplyr::left_join(picrust_raw_filtered, by = "subID") %>% 
+  dplyr::select(-`#SampleID`)
+
+# filter
+picrust_raw_sample_tofilter <- picrust_raw_sample %>% dplyr::select(-subID)
+rownames(picrust_raw_sample_tofilter) <- picrust_raw_sample$subID
+
+# offset the data (STOPPED HERE)
+picrust.offset <- picrust_raw_sample_tofilter + 1 # apply offset
+
+# remove low counts
+low.count.removal <- function(
+                        data, # OTU count df of size n (sample) x p (OTU)
+                        percent=0.05 # sum of counts is below 1% of total abundance in dataset
+                        ) 
+  {
+    keep.otu = which(colSums(data)*100/(sum(colSums(data))) > percent)
+    data.filter = data[,keep.otu]
+    return(list(data.filter = data.filter, keep.otu = keep.otu))
+}
+
+# call the function then apply on the offset data
+result.filter <- low.count.removal(picrust.offset, percent=0.05)
+data.filter <- result.filter$data.filter
+
+# check the number of variables kept after filtering (5% cutoff keeps 238 out of 504 total pathways)
+length(result.filter$keep.otu) 
+
+# clr transform
+data.clr <- logratio.transfo(as.matrix(data.filter), 
+                             logratio = 'CLR', offset = 0) 
+class(data.clr) <- "matrix"
+picrust_clr <- as.data.frame(data.clr)
+```
+
+## Calculate average NSTI to assess accuracy
+NSTI = nearest sequence taxon index
+```{r}
+# pull in data
+nsti <- read_tsv("../../data/microbiome/M24_M48/picrust/picrust2_out_pipeline/EC_metagenome_out/weighted_nsti.tsv")
+
+# filter to only include analytic sample
+nsti_test <- nsti %>% 
+  dplyr::mutate(subID = str_remove(sample, "-[0-9]+M$"),
+                Timepoint = str_extract(sample, "-[0-9]+M$"))%>% 
+  dplyr::select(subID, sample, Timepoint, everything())
+
+nsti_24m <- nsti_test %>% 
+  dplyr::filter(Timepoint == "-24M") %>% 
+  dplyr::select(-Timepoint)
+
+nsti_sample <- all_data_sample %>% 
+  dplyr::select(subID) %>% 
+  dplyr::left_join(nsti_24m, by = "subID")
+
+# calculate average of sample averages
+avg_nsti <- mean(nsti_sample$weighted_NSTI) # 0.012 (low indicates high quality?)
+```
+
+## Picrust profiles with SOFA, MTL, SAL Intra-Network Signature
+```{r}
+# initial sPLS model (should specify a large number of components first)
+tune.spls1.braincomp1.picrust <- pls(X=picrust_clr, Y=brain.int.win.comp_scores$brain_int_win_comp1, ncomp=4, mode='regression')
+
+set.seed(main.seed)  # For reproducibility with this handbook, remove otherwise
+Q2.pls1.braincomp1.picrust <- perf(tune.spls1.braincomp1.picrust, validation = 'Mfold', 
+                      folds = 10, nrepeat = 100)
+plot(Q2.pls1.braincomp1.picrust, criterion = 'Q2') # this is always below the threashold
+
+# evaluate number of variables to select from X matrix (using number of components selected above)
+list.keepX <- c(5:10, seq(15, 238, 5)) # specify selection up to the number of features in the dataset (93)
+
+# evaluate tuning w/ R^2
+set.seed(main.seed)
+tune.spls1.braincomp1.picrust.R2 <- mixOmics::tune.spls(picrust_clr, brain.int.win.comp_scores$brain_int_win_comp1, ncomp= 3, 
+                            test.keepX = list.keepX, 
+                            validation = 'Mfold', 
+                            folds = 10,
+                            nrepeat = 100, 
+                            progressBar = TRUE,
+                            measure = 'R2') 
+
+plot(tune.spls1.braincomp1.picrust.R2) #highest R^2 (0.02) is with 1 component and 5 features
+
+#how many components to keep w this?
+choice.ncomp <- tune.spls1.braincomp1.picrust.R2$choice.ncomp$ncomp #1
+
+# choice.ncomp: For supervised models; returns the optimal number of components for the model for each prediction distance using one-sided t-tests that test for a significant difference in the mean error rate (gain in prediction) when components are added to the model. 
+
+# how many x variables with 1 component? 5
+choice.keepX <- tune.spls1.braincomp1.picrust.R2$choice.keepX[1:1] #5
+
+# specify final model with 1 components, 5 features on comp1
+spls1.braincomp1.picrust <- spls(X=picrust_clr, Y=brain.int.win.comp_scores$brain_int_win_comp1, ncomp = 1, keepX = choice.keepX, 
+                    mode = "regression")
+
+# extract list of features that were selected (each component is orthogonal)
+selectVar(spls1.braincomp1.picrust, comp = 1)$X$name #selected "PWY-6270"            "PYRIDNUCSAL-PWY"     "PWY-5265"            "PWY-7392"            "HEXITOLDEGSUPER-PWY"  
+plotLoadings(spls1.braincomp1.picrust, 'X') # all are negative (higher abundance associated with lower scores on brain signature)
+
+selectVar(spls1.braincomp1.picrust, comp = 1)$X$value
+
+plot(spls1.braincomp1.picrust$variates$X, spls1.braincomp1.picrust$variates$Y,
+     xlab = 'X component', ylab = 'y component / scaled y') # no outliers
+
+cor(spls1.braincomp1.picrust$variates$X, spls1.braincomp1.picrust$variates$Y) # cor = .34
+cor.test(spls1.braincomp1.picrust$variates$X, spls1.braincomp1.picrust$variates$Y)
+spls1.braincomp1.picrust$prop_expl_var$X
+
+# determine the variable importance (loading magnitude weighted by variance explained?)
+vip.spls1.braincomp1.picrust <- vip(spls1.braincomp1.picrust)
+vip.spls1.braincomp1.picrust[selectVar(spls1.braincomp1.picrust, comp=1)$X$name, 1] # All variables iwth VIP >1 
+vip_spls1_picrust1 <- as.data.frame(vip.spls1.braincomp1.picrust[selectVar(spls1.braincomp1.picrust, comp=1)$X$name, 1]) %>% rownames_to_column(var="pathway")
+colnames(vip_spls1_picrust1) <- c("pathway", "vip")
+
+# extract scores for mb component associated with brain comp2
+braincomp1.picrust <- as.data.frame(spls1.braincomp1.picrust$variates$X) %>% 
+  dplyr::rename(picrust_braincomp1 = comp1) %>% 
+  rownames_to_column(var="subID")
+
+# evaluate stability
+set.seed(main.seed)
+perf.spls1.braincomp1.picrust <- perf(spls1.braincomp1.picrust, validation = "Mfold", folds = 10, nrepeats = 100)
+
+# extract stability values
+stab.spls1.braincomp1.picrust <- perf.spls1.braincomp1.picrust$features$stability.X$comp1
+extr.stab.spls1.braincomp1.picrust <- as.data.frame(stab.spls1.braincomp1.picrust[selectVar(spls1.braincomp1.picrust, comp=1)$X$name]) %>% rownames_to_column(var="pathway")
+colnames(extr.stab.spls1.braincomp1.picrust) <- c("pathway", "stability")
+
+# average stability in comp 1
+sum(extr.stab.spls1.braincomp1.picrust$stability) / nrow(extr.stab.spls1.braincomp1.picrust) # 0.58
+
+# consolidate all of the info on this signature
+# extract feature loadings
+braincomp1_picrust1 <- selectVar(spls1.braincomp1.picrust, comp = 1)$X$value %>% rownames_to_column(var = "pathway")
+colnames(braincomp1_picrust1)[2] <- "loading"
+
+# add stability values into dfs with loadings and vips
+picrust_load_vip_c1 <- braincomp1_picrust1 %>% left_join(vip_spls1_picrust1, by = "pathway") %>% left_join(extr.stab.spls1.braincomp1.picrust, by = "pathway") %>% 
+  dplyr::mutate(profile = "Functional Profile 1") %>% 
+  dplyr::select(pathway, loading, vip, stability, profile)
+
+write_csv(picrust_load_vip_c1, "tables/picrustComp1.csv")
+
+cor.test(braincomp1_picrust1)
+```
+
+## Graph picrust profile 1 loadings
+```{r}
+# create a factor that sorts the loadings by magnitude 
+braincomp2_picrust1$pathway <- factor(braincomp2_picrust1$pathway, levels = braincomp2_picrust1$pathway[order(braincomp2_picrust1$loading, decreasing = TRUE)])
+
+# graph the 3 highest loadings (those with VIP >1 )by magnitude
+picrust_pattern1 <- ggplot(braincomp2_picrust1 %>% slice_max(., n=1, order_by=abs(loading)), aes(x = reorder(pathway, loading), y = loading)) +
+  geom_col(fill = '#95cacb') + 
+  coord_flip() +
+  ylab("Loading") + xlab("Pathway") +
+  labs(tag = "B") +
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=12), axis.text.y = element_text(color="black", size=12), axis.title = element_text(size=16), plot.margin = margin(10, 10, 10, 10), plot.tag=element_text(size=14)) +
+  ggtitle("Functional \n Profile 1") +
+  theme(plot.title = element_text(hjust=0.5, size=14, face='bold'))
+```
+
+
+## Picrust profiles with SOFA Inter-Network Signature
+```{r}
+# initial sPLS model (should specify a large number of components first)
+tune.spls1.braincomp2.picrust <- pls(X=picrust_clr, Y=brain.int.win.comp_scores$brain_int_win_comp2, ncomp=4, mode='regression')
+
+# evaluate number of variables to select from X matrix (using number of components selected above)
+list.keepX <- c(5:10, seq(15, 238, 5)) # specify selection up to the number of features in the dataset (93)
+
+# evaluate tuning w/ R^2
+set.seed(main.seed)
+tune.spls1.braincomp2.picrust.R2 <- mixOmics::tune.spls(picrust_clr, brain.int.win.comp_scores$brain_int_win_comp2, ncomp= 3, 
+                            test.keepX = list.keepX, 
+                            validation = 'Mfold', 
+                            folds = 10,
+                            nrepeat = 100, 
+                            progressBar = TRUE,
+                            measure = 'R2') 
+
+plot(tune.spls1.braincomp2.picrust.R2) #highest R^2 (0.05) is with 2 components and 5 features each
+
+#how many components to keep w this?
+choice.ncomp <- tune.spls1.braincomp2.picrust.R2$choice.ncomp #even though 1 was selected here bc there was no statistically sig. increase in R2 with 2 vs 1, we're going with 2 bc it's the maximum
+# how many x variables with 1 component? 5
+choice.keepX <- tune.spls1.braincomp2.picrust.R2$choice.keepX[1:2] #5
+
+# specify final model with 2 components, 5 features on each
+spls1.braincomp2.picrust <- spls(X=picrust_clr, Y=brain.int.win.comp_scores$brain_int_win_comp2, ncomp = 2, keepX = choice.keepX, 
+                    mode = "regression")
+
+# extract list of features that were selected (each component is orthogonal)
+selectVar(spls1.braincomp2.picrust, comp = 1)$X$name #selected "PENTOSE-P-PWY" "PWY-6901"      "PWY-7377"      "PWY-7234"      "PWY-8011" 
+plotLoadings(spls1.braincomp2.picrust, 'X') # some negative, some positive
+selectVar(spls1.braincomp2.picrust, comp = 2)$X$name #selected "PWY3O-4107"      "PYRIDNUCSAL-PWY" "UDPNAGSYN-PWY"   "PWY-5345"        "P4-PWY" 
+plotLoadings(spls1.braincomp2.picrust, 'X', comp=2) # all pos except 1
+
+
+selectVar(spls1.braincomp2.picrust, comp = 1)$X$value
+
+plot(spls1.braincomp2.picrust$variates$X, spls1.braincomp2.picrust$variates$Y,
+     xlab = 'X component', ylab = 'y component / scaled y') # no outliers
+
+cor(spls1.braincomp2.picrust$variates$X, spls1.braincomp2.picrust$variates$Y) # comp 1 cor = .41, comp2 cor = 0.47
+spls1.braincomp2.picrust$prop_expl_var$X
+
+# determine the variable importance (loading magnitude weighted by variance explained?)
+vip.spls1.braincomp2.picrust <- vip(spls1.braincomp2.picrust)
+vip.spls1.braincomp2.picrust[selectVar(spls1.braincomp2.picrust, comp=1)$X$name, 1] # All variables iwth VIP >1 
+vip_spls1_picrust2 <- as.data.frame(vip.spls1.braincomp2.picrust[selectVar(spls1.braincomp2.picrust, comp=1)$X$name, 1]) %>% rownames_to_column(var="pathway")
+colnames(vip_spls1_picrust2) <- c("pathway", "vip")
+vip_spls1_picrust3 <- as.data.frame(vip.spls1.braincomp2.picrust[selectVar(spls1.braincomp2.picrust, comp=2)$X$name, 2]) %>% rownames_to_column(var="pathway")
+colnames(vip_spls1_picrust3) <- c("pathway", "vip")
+
+# extract scores for mb component associated with brain comp2
+braincomp2.picrust <- as.data.frame(spls1.braincomp2.picrust$variates$X) %>% 
+  dplyr::rename(picrust_braincomp2 = comp1,
+                picrust2_braincomp2 = comp2) %>% 
+  rownames_to_column(var="subID")
+
+# evaluate stability
+set.seed(main.seed)
+perf.spls1.braincomp2.picrust <- perf(spls1.braincomp2.picrust, validation = "Mfold", folds = 10, nrepeats = 100)
+
+# extract stability values
+stab.spls1.braincomp2.picrust2 <- perf.spls1.braincomp2.picrust$features$stability.X$comp1
+extr.stab.spls1.braincomp2.picrust <- as.data.frame(stab.spls1.braincomp2.picrust2[selectVar(spls1.braincomp2.picrust, comp=1)$X$name]) %>% rownames_to_column(var="pathway")
+colnames(extr.stab.spls1.braincomp2.picrust) <- c("pathway", "stability")
+#STOPPED HERE
+stab.spls1.braincomp2.picrust3 <- perf.spls1.braincomp2.picrust$features$stability.X$comp2
+extr.stab.spls1.braincomp2.picrus3 <- as.data.frame(stab.spls1.braincomp2.picrust3[selectVar(spls1.braincomp2.picrust, comp=2)$X$name]) %>% rownames_to_column(var="pathway")
+colnames(extr.stab.spls1.braincomp2.picrus3) <- c("pathway", "stability")
+
+
+# average stability per component
+sum(extr.stab.spls1.braincomp2.picrust$stability) / nrow(extr.stab.spls1.braincomp2.picrust) # 0.74
+sum(extr.stab.spls1.braincomp2.picrus3$stability) / nrow(extr.stab.spls1.braincomp2.picrus3) # 0.72
+
+# consolidate all of the info on this signature
+# extract feature loadings
+braincomp2_picrust2 <- selectVar(spls1.braincomp2.picrust, comp = 1)$X$value %>% rownames_to_column(var = "pathway")
+colnames(braincomp2_picrust2)[2] <- "loading"
+braincomp2_picrust3 <- selectVar(spls1.braincomp2.picrust, comp = 2)$X$value %>% rownames_to_column(var = "pathway")
+colnames(braincomp2_picrust3)[2] <- "loading"
+
+# add stability values into dfs with loadings and vips
+picrust_load_vip_c2 <- braincomp2_picrust2 %>% left_join(vip_spls1_picrust2, by = "pathway") %>% left_join(extr.stab.spls1.braincomp2.picrust, by = "pathway") %>% 
+  dplyr::mutate(profile = "Functional Profile 2") %>% 
+  dplyr::select(pathway, loading, vip, stability, profile)
+picrust_load_vip_c3 <- braincomp2_picrust3 %>% left_join(vip_spls1_picrust3, by = "pathway") %>% left_join(extr.stab.spls1.braincomp2.picrus3, by = "pathway") %>% 
+  dplyr::mutate(profile = "Functional Profile 3") %>% 
+  dplyr::select(pathway, loading, vip, stability, profile)
+
+picrust_load_vip_all <- picrust_load_vip_c1 %>% bind_rows(picrust_load_vip_c2) %>% bind_rows(picrust_load_vip_c3)
+
+write_csv(picrust_load_vip_all, "tables/TableS4_R1_picrust.csv")
+```
+
+## Graph picrust associations with SOFA Inter-Network signature
+```{r}
+# create a factor that sorts the loadings by magnitude 
+braincomp2_picrust2$pathway <- factor(braincomp2_picrust2$pathway, levels = braincomp2_picrust2$pathway[order(braincomp2_picrust2$loading, decreasing = TRUE)])
+
+# graph the 3 highest loadings (those with VIP >1)by magnitude
+picrust_pattern2 <- ggplot(braincomp2_picrust2 %>% slice_max(., n=3, order_by=abs(loading)), aes(x = reorder(pathway, loading), y = loading)) +
+  geom_col(fill = '#fd988d') + 
+  coord_flip() +
+  ylab("Loading") + xlab("Pathway") +
+  labs(tag = "B") +
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=12), axis.text.y = element_text(color="black", size=12), axis.title = element_text(size=16), plot.margin = margin(10, 10, 10, 10), plot.tag=element_text(size=14)) +
+  ggtitle("Functional \n Profile 2") +
+  theme(plot.title = element_text(hjust=0.5, size=14, face='bold'))
+
+# graph the 3 highest loadings for profile 3
+braincomp2_picrust3$pathway <- factor(braincomp2_picrust3$pathway, levels = braincomp2_picrust3$pathway[order(braincomp2_picrust3$loading, decreasing = TRUE)])
+
+picrust_pattern3 <- ggplot(braincomp2_picrust3 %>% slice_max(., n=3, order_by=abs(loading)), aes(x = reorder(pathway, loading), y = loading)) +
+  geom_col(fill = '#fd988d') + 
+  coord_flip() +
+  ylab("Loading") + xlab("Pathway") +
+  labs(tag = "B") +
+  theme_bw() +
+  theme(axis.text.x = element_text(color="black", size=12), axis.text.y = element_text(color="black", size=12), axis.title = element_text(size=16), plot.margin = margin(10, 10, 10, 10), plot.tag=element_text(size=14)) +
+  ggtitle("Functional \n Profile 3") +
+  theme(plot.title = element_text(hjust=0.5, size=14, face='bold'))
+```
+
+## Picrust associations with brain components, controlling for covariates
+```{r}
+
+# add component scores to main analysis dataset
+all_data_add <- all_data_add %>% dplyr::left_join(braincomp1.picrust, by = "subID") %>% left_join(braincomp2.picrust, by = "subID") 
+
+# p-values for correlations
+cor.test(all_data_add$picrust_braincomp2, all_data_add$brain_int_win_comp2)
+cor.test(all_data_add$picrust2_braincomp2, all_data_add$brain_int_win_comp2)
+cor.test(all_data_add$picrust_braincomp1, all_data_add$brain_int_win_comp1)
+
+# comp1 mb, comp1 brain
+braincomp1_picrust_add <- lm(brain_int_win_comp1 ~ picrust_braincomp1 + sex_centered + BW_centered + GA_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp1_picrust_add, robust=TRUE, show.std=TRUE, show.se=TRUE) # beta = 0.48, SE = 0.17, p .024
+
+# compute partial r squared in a paths
+partial_r2(braincomp1_picrust_add)
+
+# comp1 mb, comp2 brain
+braincomp2_picrust2_add <- lm(brain_int_win_comp2 ~ picrust_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp2_picrust2_add, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns, B=.13, SE = 0.18, p = .47
+
+partial_r2(braincomp2_mb1_add)
+
+# comp2 mb, comp2 brain
+braincomp2_picrust3_add <- lm(brain_int_win_comp2 ~ picrust2_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` +  meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp2_picrust3_add, robust=TRUE, show.std=TRUE, show.se=TRUE) #ns, B=0.32, SE = 0.17, p = .037
+
+partial_r2(braincomp2_mb2_add)
+```
+
+## Picrust associations with internalizing symptoms, controlling for covariates (Mediation model total effects)
+```{r}
+# functional profile 1
+braincomp1_comp1picrust_int <- lm(cbclintprobtot_y7_pos_boxcox ~ picrust_braincomp1 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp1_comp1picrust_int, robust=TRUE, show.std=TRUE, show.se=TRUE) #B = .47, SE = .32, p = .16
+
+# compute partial r squared in the total effect
+partial_r2(braincomp1_comp1picrust_int)
+
+# functional profile 2
+braincomp2_comp1picrust_int <- lm(cbclintprobtot_y7_pos_boxcox ~ picrust_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp2_comp1picrust_int, robust=TRUE, show.std=TRUE, show.se=TRUE) # B = .30, SE = .25, p = .24
+
+partial_r2(braincomp2_comp1picrust_int)
+
+# functional profile 3
+braincomp2_comp2picrust_int <- lm(cbclintprobtot_y7_pos_boxcox ~ picrust2_braincomp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+tab_model(braincomp2_comp2picrust_int, robust=TRUE, show.std=TRUE, show.se=TRUE) # B = .28, SE = .19, p = .15
+
+partial_r2(braincomp2_comp2picrust_int)
+```
+
+## Picrust mediations
+```{r}
+process(data=all_data_add, y="cbclintprobtot_y7_pos_boxcox", x="picrust_braincomp1", m=c("brain_int_win_comp1"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered", "mother_univ_pw11"), model=4, seed=100770, stand=1) # significant a path, b path, n.s. positive direct and indirect effects (sig positive total effect given above)
+
+process(data=all_data_add, y="cbclintprobtot_y7_pos_boxcox", x="picrust_braincomp2", m=c("brain_int_win_comp2"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered", "mother_univ_pw11"), model=4, seed=100770, stand=1) # significant a path, n.s. b path, n.s. positive direct and indirect effects (n.s. positive total effect)
+
+process(data=all_data_add, y="cbclintprobtot_y7_pos_boxcox", x="picrust2_braincomp2", m=c("brain_int_win_comp2"), cov=c("sex_centered", "GA_centered", "BW_centered", "deliv_mode", "Fat_%energy", "Fibre.per.1000kcal", "PUFA_%", "meanFD_centered", "mother_univ_pw11"), model=4, seed=100770, stand=1) # significant a path and b path, significant positive indirect effect, n.s. negative direct effect (n.s. but positive total effect)
+```
+
+## Specify b paths to get partial r squared
+```{r}
+# specify b path models, calc parital r squared
+braincomp1_picrust1_bpath <- lm(cbclintprobtot_y7_pos_boxcox ~ picrust_braincomp1 + brain_int_win_comp1 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+
+partial_r2(braincomp1_picrust1_bpath)
+
+braincomp2_picrust2_bpath <- lm(cbclintprobtot_y7_pos_boxcox ~ picrust_braincomp2 + brain_int_win_comp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+
+partial_r2(braincomp2_picrust2_bpath)
+
+braincomp2_picrust3_bpath <- lm(cbclintprobtot_y7_pos_boxcox ~ picrust2_braincomp2 + brain_int_win_comp2 + sex_centered + GA_centered + BW_centered + deliv_mode + `Fat_%energy` + Fibre.per.1000kcal + `PUFA_%` + meanFD_centered + mother_univ_pw11, data = all_data_add)
+
+partial_r2(braincomp2_picrust3_bpath)
+```
+## Added in reviews: Pipe in sequencing batch and test for differences
+```{r}
+batch <- read_tsv("../../data/microbiome/M24_M48/original_files/SampleID_mapping.txt") %>% 
+  rename(subID = GUSTOid) %>% 
+  filter(Timepoint_months=="24") %>% 
+  dplyr::select(-`#Sample_ID`, -Timepoint_months)
+
+all_data_add <- all_data_add %>% left_join(batch, by = "subID")
+
+# differences by sequencing batch
+t.test(observed_features~Sequencing_batch, data=all_data_add) #ns
+t.test(shannon_entropy~Sequencing_batch, data=all_data_add) #ns
+t.test(pielou_evenness~Sequencing_batch, data=all_data_add) # ns
+t.test(faith_pd~Sequencing_batch, data=all_data_add) #ns
+t.test(cbclintprobtot_y7~Sequencing_batch, data=all_data_add) #ns
+```
+
