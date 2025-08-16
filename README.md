@@ -1,5 +1,7 @@
 # gusto_microbiome_brain_internalizingsx
-Analysis scripts used for the manuscript "Childhood gut microbiome is linked to internalizing symptoms at school age via the functional connectome", accepted at Nature Communications. 
+Analysis scripts used for the manuscript "Childhood gut microbiome is linked to internalizing symptoms at school age via the functional connectome", accepted at Nature Communications.   
+
+DOI (from Zenudo): <img width="191" height="20" alt="image" src="https://github.com/user-attachments/assets/6a00d8ec-6ca1-4905-95bb-7386ddefee71" />
 
 Preprint can be found at: https://osf.io/preprints/psyarxiv/u9dw5 
 Supplemental materials for the preprint and a link to this repo can be found at: https://osf.io/unh6b/
